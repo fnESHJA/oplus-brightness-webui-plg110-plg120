@@ -1,0 +1,8 @@
+id=oplus_brightness_control
+name=OPlus 亮度控制 WebUI - PLG110/120 显示适配
+version=1.0.0
+versionCode=10000
+author=fnESHJA & Codex
+description=[未初始化] JSON: /data/adb/modules/oplus_brightness_control/config/config.json | ETC: /data/adb/modules/oplus_brightness_control/data/original/etc
+actionIcon=webroot/assets/action.svg
+webuiIcon=webroot/assets/icon.svg

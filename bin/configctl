@@ -1,0 +1,1660 @@
+#!/system/bin/sh
+
+# OPlus Brightness Control runtime compiler.
+# Android side intentionally depends only on POSIX sh + BusyBox/toybox applets.
+
+SELF_DIR=${0%/*}
+MODDIR=$(CDPATH= cd "$SELF_DIR/.." 2>/dev/null && pwd)
+TARGET_ETC=/my_product/vendor/etc
+ORIGINAL="$MODDIR/data/original/etc"
+GENERATED="$MODDIR/data/generated/etc"
+STATE="$MODDIR/data/state"
+BACKUPS="$MODDIR/data/backups"
+LOGDIR="$MODDIR/data/logs"
+CONFIG_PATH="$MODDIR/config/config.json"
+CONFIG="$CONFIG_PATH"
+DEFAULTS="$MODDIR/config/defaults.json"
+LOCK="$MODDIR/data/.apply.lock"
+
+mkdir -p "$STATE" "$BACKUPS" "$LOGDIR" 2>/dev/null
+
+log() {
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" "$*" >> "$LOGDIR/apply.log"
+}
+
+json_escape() {
+  awk 'BEGIN{ORS=""} { if (NR>1) printf "\\n"; gsub(/\\/,"\\\\"); gsub(/\"/,"\\\""); gsub(/\r/,"\\r"); gsub(/\t/,"\\t"); printf "%s",$0 }'
+}
+
+json_quote() {
+  printf '"%s"' "$(printf '%s' "$1" | json_escape)"
+}
+
+json_string_array() {
+  awk '
+    BEGIN { printf "["; first=1 }
+    {
+      gsub(/\\/, "\\\\"); gsub(/\"/, "\\\""); gsub(/\r/, "");
+      if (!first) printf ","; printf "\"%s\"", $0; first=0
+    }
+    END { printf "]" }
+  '
+}
+
+json_array_strings() {
+  # Decode a JSON array of strings without splitting commas inside strings.
+  awk '
+    { data=data $0 "\n" }
+    END {
+      in_string=0; esc=0; value=""
+      for (i=1; i<=length(data); i++) {
+        c=substr(data,i,1)
+        if (!in_string) { if (c=="\"") { in_string=1; value="" } }
+        else if (esc) {
+          if (c=="n") value=value "\n"; else if (c=="t") value=value "\t"; else value=value c
+          esc=0
+        } else if (c=="\\") esc=1
+        else if (c=="\"") { print value; in_string=0 }
+        else value=value c
+      }
+    }
+  '
+}
+
+csv_json() {
+  printf '%s' "$1" | awk '{ gsub(/[[:space:]]/,""); if ($0=="") print "[]"; else print "[" $0 "]" }'
+}
+
+cfg_raw() {
+  key=$1
+  awk -v key="$key" '
+    index($0,"\"" key "\":{") {
+      s=$0; sub(/^.*\"value\":/,"",s); sub(/,\"_comment\":.*$/,"",s); print s; exit
+    }
+  ' "$CONFIG"
+}
+
+cfg_original() {
+  key=$1
+  awk -v key="$key" '
+    index($0,"\"" key "\":{") {
+      s=$0; sub(/^.*\"original\":/,"",s); sub(/,\"safe_range\":.*$/,"",s); print s; exit
+    }
+  ' "$CONFIG"
+}
+
+cfg_scalar() {
+  cfg_raw "$1" | sed 's/^"//;s/"$//'
+}
+
+cfg_numbers() {
+  cfg_raw "$1" | tr -d '[][:space:]' | tr ',' '\n' | sed '/^$/d'
+}
+
+set_cfg_raw() {
+  key=$1
+  raw=$2
+  out="$CONFIG.tmp.$$"
+  awk -v key="$key" -v raw="$raw" '
+    BEGIN{q=sprintf("%c",34);keymark=q key q ":{";valuemark=q "value" q ":";commentmark="," q "_comment" q ":"}
+    index($0,keymark) {
+      vp=index($0,valuemark);cp=index($0,commentmark)
+      if(!vp||!cp||cp<=vp)exit 8
+      print substr($0,1,vp+length(valuemark)-1) raw substr($0,cp);done=1;next
+    }
+    {print}
+    END{if(!done)exit 9}
+  ' "$CONFIG" > "$out" || { rm -f "$out"; return 1; }
+  mv -f "$out" "$CONFIG"
+}
+
+normalize_auto_curve_config() {
+  raw=$(cfg_raw auto_curve)
+  normalized=$(printf '%s\n' "$raw" | awk '
+    function fmt(v,s){s=sprintf("%.6f",v);sub(/0+$/,"",s);sub(/\.$/,"",s);return s}
+    {
+      s=$0
+      if(s !~ /^\[\[/ || s !~ /\]\]$/)exit 1
+      gsub(/\[/,"",s);gsub(/\]/,"",s);gsub(/[[:space:]]/,"",s)
+      n=split(s,a,",");if(n<4||n%2)exit 1
+      count=n/2
+      for(i=1;i<=count;i++){x[i]=a[i*2-1]+0;y[i]=a[i*2]+0}
+      for(i=1;i<=count;i++)for(j=i+1;j<=count;j++)if(x[j]<x[i]){t=x[i];x[i]=x[j];x[j]=t;t=y[i];y[i]=y[j];y[j]=t}
+      for(i=1;i<=count;i++){
+        if(x[i]<0)x[i]=0;if(y[i]<0)y[i]=0
+        if(i>1&&x[i]<=x[i-1])x[i]=x[i-1]+1
+        if(i>1&&y[i]<y[i-1])y[i]=y[i-1]
+      }
+      printf "[";for(i=1;i<=count;i++){if(i>1)printf ",";printf "[%s,%s]",fmt(x[i]),fmt(y[i])}print "]"
+    }
+  ') || return 0
+  [ -n "$normalized" ] || return 0
+  [ "$normalized" = "$raw" ] || set_cfg_raw auto_curve "$normalized"
+}
+
+xml_value() {
+  file=$1 tag=$2
+  awk -v tag="$tag" '
+    BEGIN { opening="<" tag; closing="</" tag ">"; collecting=0; value="" }
+    {
+      probe=$0; sub(/^[[:space:]]*/,"",probe)
+      if (!collecting && index(probe,opening)==1) {
+        s=probe; p=index(s,">"); if(!p)next; s=substr(s,p+1)
+        e=index(s,closing)
+        if (e>0) { s=substr(s,1,e-1); gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); print s; exit }
+        collecting=1; next
+      }
+      if (collecting) {
+        s=$0
+        e=index(s,closing)
+        if (e>0) { s=substr(s,1,e-1); collecting=0; done=1 }
+        gsub(/^[[:space:]]+|[[:space:]]+$/,"",s)
+        if (s!="") value=value s
+        if (done) { print value; exit }
+      }
+    }
+  ' "$file"
+}
+
+xml_attr() {
+  file=$1 tag=$2 attr=$3
+  awk -v tag="$tag" -v attr="$attr" '
+    index($0,"<" tag) {
+      s=$0; p=index(s,attr "=\""); if (!p) next
+      s=substr(s,p+length(attr)+2); sub(/\".*$/,"",s); print s; exit
+    }
+  ' "$file"
+}
+
+xml_tag_attr_text() {
+  file=$1 tag=$2 attr=$3 wanted=$4
+  awk -v tag="$tag" -v attr="$attr" -v wanted="$wanted" '
+    index($0,"<" tag) && index($0,attr "=\047" wanted "\047") {
+      s=$0; sub("^[^>]*>","",s); sub("</" tag ">.*$","",s); print s; exit
+    }
+  ' "$file"
+}
+
+apps_from_scope() {
+  file=$1 kind=$2 wanted=$3
+  awk -v kind="$kind" -v wanted="$wanted" '
+    function app(line, s) { s=line; sub(/^.*<app>/,"",s); sub(/<\/app>.*$/,"",s); return s }
+    kind=="foss" && /<foss / { outer=1 }
+    kind=="foss" && outer && index($0,"<type id=\"" wanted "\"") { active=1 }
+    kind=="foss" && active && /<\/type>/ { active=0; exit }
+    kind=="method" && index($0,"<method id=\"" wanted "\"") { active=1 }
+    kind=="method" && active && /<\/method>/ { active=0; exit }
+    kind=="global" && /<global_brightness_limit / { active=1 }
+    kind=="global" && active && /<\/global_brightness_limit>/ { active=0; exit }
+    kind=="window" && /<window_brightness>/ { active=1 }
+    kind=="window" && active && /<\/window_brightness>/ { active=0; exit }
+    kind=="uir" && /<app_list>/ { active=1 }
+    kind=="uir" && active && /<\/app_list>/ { active=0; exit }
+    kind=="dbi" && /<app_list / { active=1 }
+    kind=="dbi" && active && /<\/app_list>/ { active=0; exit }
+    active && /<app>/ { value=app($0); if(!seen[value]++) print value }
+  ' "$file"
+}
+
+scope_value() {
+  file=$1 kind=$2 wanted=$3 tag=$4 mode=$5
+  awk -v kind="$kind" -v wanted="$wanted" -v tag="$tag" -v mode="$mode" '
+    kind=="foss" && index($0,"<type id=\"" wanted "\"") { active=1 }
+    kind=="foss" && active && /<\/type>/ { exit }
+    kind=="method" && index($0,"<method id=\"" wanted "\"") { active=1 }
+    kind=="method" && active && /<\/method>/ { exit }
+    active && index($0,"<" tag) {
+      if (mode!="" && index($0,"mode=\"" mode "\"")==0) next
+      s=$0; sub("^.*<" tag "[^>]*>","",s); sub("</" tag ">.*$","",s); gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); print s; exit
+    }
+  ' "$file"
+}
+
+section_value() {
+  file=$1 section=$2 tag=$3
+  awk -v section="$section" -v tag="$tag" '
+    index($0,"<" section ">") { active=1; next }
+    active && index($0,"</" section ">") { exit }
+    active && index($0,"<" tag) {
+      s=$0; sub("^.*<" tag "[^>]*>","",s); sub("</" tag ">.*$","",s); gsub(/^[[:space:]]+|[[:space:]]+$/,"",s); print s; exit
+    }
+  ' "$file"
+}
+
+auto_curve_json() {
+  awk '
+    /<lux_table name="expressiveness">/ { active=1; printf "["; first=1; next }
+    active && /<\/lux_table>/ { print "]"; exit }
+    active && /<lux>/ {
+      s=$0; sub(/^.*<lux>/,"",s); sub(/<\/lux>.*$/,"",s); gsub(/[[:space:]]/,"",s)
+      split(s,a,","); if (!first) printf ","; printf "[%s,%s]",a[1],a[2]; first=0
+    }
+  ' "$1"
+}
+
+voltage_json() {
+  awk '
+    function attr(line,name, s,p) { p=index(line,name "=\""); if(!p)return ""; s=substr(line,p+length(name)+2); sub(/\".*$/,"",s); return s }
+    /<lowvoltage_brightness_limit / { temp=attr($0,"temperatureRange"); row=temp; active=1; next }
+    active && /<limitnit / {
+      bat=attr($0,"batteryRange"); s=$0; sub(/^[^>]*>/,"",s); sub(/<\/limitnit>.*$/,"",s); gsub(/[[:space:]]/,"",bat); gsub(/[[:space:]]/,"",s); row=row "|" bat "=" s
+    }
+    active && /<\/lowvoltage_brightness_limit>/ { print row; active=0 }
+  ' "$1" | json_string_array
+}
+
+dbvgain_json() {
+  awk '
+    function attr(line,name, s,p) { p=index(line,name "=\""); if(!p)return ""; s=substr(line,p+length(name)+2); sub(/\".*$/,"",s); return s }
+    /<dbv_gain_fps / { fps=attr($0,"fps") }
+    /<dbv_gain id=/ { active=1; id=attr($0,"id"); dbv=attr($0,"dbv"); r=""; g=""; b="" }
+    active && /<gamma_mapping sub="r"/ { s=$0; sub(/^[^>]*>/,"",s); sub(/<\/gamma_mapping>.*$/,"",s); gsub(/[[:space:]]/,"",s); r=s }
+    active && /<gamma_mapping sub="g"/ { s=$0; sub(/^[^>]*>/,"",s); sub(/<\/gamma_mapping>.*$/,"",s); gsub(/[[:space:]]/,"",s); g=s }
+    active && /<gamma_mapping sub="b"/ { s=$0; sub(/^[^>]*>/,"",s); sub(/<\/gamma_mapping>.*$/,"",s); gsub(/[[:space:]]/,"",s); b=s }
+    active && /<\/dbv_gain>/ { print fps "|" id "|" dbv "|" r "|" g "|" b; active=0 }
+  ' "$1" | json_string_array
+}
+
+mapping_data() {
+  BFILE=$(cfg_scalar brightness_file)
+  AFILE=$(cfg_scalar apollo_file)
+  bfile="$ORIGINAL/$BFILE"
+  afile="$ORIGINAL/$AFILE"
+  [ -f "$bfile" ] && [ -f "$afile" ] || { echo "映射原厂文件不存在" >&2; return 1; }
+  echo '# level|brightness_index|brightness_nit|brightness_gain|apollo_dbv|apollo_nit'
+  awk -F',' '
+    function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/,"",s);return s}
+    NR==FNR && /<Level>/ {
+      s=$0; sub(/^.*<Level>/,"",s); sub(/<\/Level>.*$/,"",s)
+      n=split(s,a,","); if(n<3)next
+      id=trim(a[1]); adb[id]=trim(a[2]); anit[id]=trim(a[n]); next
+    }
+    /<level>/ {
+      s=$0; sub(/^.*<level>/,"",s); sub(/<\/level>.*$/,"",s)
+      n=split(s,a,","); if(n<4)next
+      id=trim(a[1]); print id "|" trim(a[2]) "|" trim(a[3]) "|" trim(a[4]) "|" adb[id] "|" anit[id]
+    }
+  ' "$afile" "$bfile"
+}
+
+eyeprotect_json() {
+  for f in "$ORIGINAL"/EyeProtect/*.xml; do
+    [ -f "$f" ] || continue
+    name=$(basename "$f")
+    temp=$(xml_value "$f" Color_Temp | tr -d '[:space:]')
+    red=$(xml_value "$f" Red | tr -d '[:space:]')
+    green=$(xml_value "$f" Green | tr -d '[:space:]')
+    blue=$(xml_value "$f" Blue | tr -d '[:space:]')
+    def=$(xml_value "$f" Default | tr -d '[:space:]')
+    printf '%s\n' "$name|$def|$temp|$red|$green|$blue"
+  done | json_string_array
+}
+
+simple_apps_json() {
+  awk '/<app>/{s=$0;sub(/^.*<app>/,"",s);sub(/<\/app>.*$/,"",s);if(!seen[s]++)print s}' "$1" | json_string_array
+}
+
+setting_impact_note() {
+  impact_key=$1 impact_unit=$2
+  case "$impact_key" in
+    manual_max_level) printf '%s' '影响手动亮度滑块的最高请求等级；提高可让滑块进入更靠后的原厂映射，降低会使手动亮度更早封顶。最终仍受应用、温控、电池和面板映射限制。' ;;
+    auto_curve) printf '%s' '影响自动亮度而非手动滑块；提高某个 Lux 点的 nit 会提高该照度附近的目标亮度，降低则变暗。保存时会排序并保证 Lux 递增、nit 不下降。' ;;
+    hbm_lux) printf '%s' '影响高环境光 HBM 触发；提高后需要更强光才触发，降低后更容易触发并增加耗电、温升和烧屏风险。' ;;
+    hbm_cct|hbm_lux_table_mode) printf '%s' '这是 HBM 条件或策略编号，不是亮度值，不能按数值越大屏幕越亮解释；错误值可能使 HBM 不触发或异常触发。' ;;
+    global_limit|window_limit) printf '%s' '这是应用层 nit 上限；提高会允许匹配应用请求更高亮度，降低会更早钳位，但不会突破温控、电池和面板能力。' ;;
+    global_exceptions) printf '%s' '名单决定哪些应用绕过全局应用上限；增加包名会放宽该应用，删除后重新受全局上限限制，但其他保护仍有效。' ;;
+    uir_brightness_limit) printf '%s' '这是 UIR 工作的亮度门限而非物理峰值；改变会移动 UIR 进入相应策略区间的时机，并与温度、倍率和名单共同生效。' ;;
+    uir_temperature_limit|force_temperature_limit) printf '%s' '这是显示温控条件；提高会在更高温度仍允许亮度或增强，可能更亮但增加温升风险，降低则更早降亮保护。' ;;
+    uir_max_ratio) printf '%s' '影响 UIR 最大增强幅度；提高允许更强增强和更高功耗，降低会减弱增强，最终仍受面板和保护策略钳位。' ;;
+    foss*_ratio) printf '%s' '影响 FOSS 名单应用的降亮比例；提高通常使应用更暗，降低会减弱降亮，0 通常表示不额外降亮。' ;;
+    method*_nit*|game_brightness_nit) printf '%s' '这是场景策略的输入 nit 坐标，不是直接的最终亮度；提高或降低会移动对应 ratio 和 rate 分段的触发位置。' ;;
+    method*_ratio*|game_brightness_ratio) printf '%s' '这是场景亮度调整比例；提高通常加强降亮或修正，降低会减弱，具体结果还受同组 nit 坐标和其他上限影响。' ;;
+    method*_rate*|game_brightness_rate) printf '%s' '只影响亮度进入或退出该场景时的过渡速度；提高通常变化更快，降低更平滑，不改变目标上限。' ;;
+    game_edr_*_origin) printf '%s' '这是所有名单游戏共用的 EDR 输入亮度坐标；改变会移动增强分段，不是每游戏独立上限。' ;;
+    game_edr_*_enhance) printf '%s' '这是所有名单游戏共用的 EDR 增强目标；提高可增强高光但增加功耗温升，降低会减弱增强。' ;;
+    voltage_matrix) printf '%s' '这是低温和低电量组合下的保护上限；提高会放宽保护并增加低压闪屏或关机风险，降低会更早降亮。' ;;
+    dolby_temperature_nits) printf '%s' '影响 Dolby 各温度档位的亮度上限；提高某档会放宽该温度下的亮度，降低会加强保护，9999 常表示该档不主动限制。' ;;
+    dark_env_lux) printf '%s' '定义暗环境降亮的 Lux 触发坐标；提高坐标会扩大到更亮环境，降低会收窄范围，本身不定义降亮量。' ;;
+    dark_env_scale) printf '%s' '定义暗环境缩放比例；提高通常使对应暗环境更暗，降低会减弱额外降亮。' ;;
+    comfortable_thresholds) printf '%s' '这是运动场景的 Lux 判断门限而非 nit；提高通常推迟场景切换，降低会更早切换。' ;;
+    backlight_*) printf '%s' '仅改变亮度统计或上报分桶，不向面板发送新的亮度请求，因此通常不会直接改变屏幕亮度。' ;;
+    adfr_*) printf '%s' '用于最低刷新率判断；亮度或 Lux 数值是刷新率条件而非提亮指令，改变可能影响流畅度和耗电。' ;;
+    dbi_*) printf '%s' '控制 DBI 内容采集或显示联动，不直接定义峰值亮度；改变主要影响参与应用、采样行为或服务开销。' ;;
+    mapping_nit_multiplier) printf '%s' '缩放两个文件的整张 nit 标定；大于 1 提高声明亮度，小于 1 降低，但不同时改变 DBV 时可能与真实驱动不匹配。' ;;
+    mapping_dbv_multiplier) printf '%s' '缩放 Apollo 物理 DBV；提高通常增加驱动亮度和风险，降低通常变暗，结果永远不得超过 4095。' ;;
+    mapping_edit_mode) printf '%s' '联动模式保证同一 Level 的两个 nit 相等；分开模式允许不同，但可能造成框架请求与 Apollo 驱动映射不一致。' ;;
+    mapping_shared_dbv_propagation) printf '%s' '开启后会同步所有原厂共用同一 DBV 的 Level，包括更前面的等级，并保持 DBV 序列不下降；关闭可能产生亮度跳变。' ;;
+    mapping_overrides) printf '%s' '单行值优先于统一倍率；提高 DBV 通常更亮，提高 nit 改变亮度标定。编辑器和后端会保持分组及前后单调关系。' ;;
+    demura_*) printf '%s' '影响面板局部均匀性补偿而非普通峰值亮度；错误修改可能造成亮度不均、色块或色偏。' ;;
+    eyeprotect_profiles) printf '%s' '影响护眼和色彩模式的白点及 RGB 通道亮度，不用于提高全屏峰值；错误曲线会造成明显偏色。' ;;
+    dbvgain_entries) printf '%s' '影响不同刷新率和 DBV 节点的灰阶及 RGB Gamma；错误值可能黑屏、闪屏或色偏，不能作为普通提亮手段。' ;;
+    unsafe_mode|unsafe_acknowledgement) printf '%s' '只控制模块是否允许危险配置通过校验，本身不会提亮；XML 结构、数组长度和 DBV 4095 硬限制始终有效。' ;;
+    *_apps|window_apps|uir_apps) printf '%s' '这是触发名单而非亮度值；增加包名会让应用参与对应策略，删除后不再由该策略控制，同一应用命中多个名单时可能叠加。' ;;
+    *_switch|*_support|*_enable|BrightnessHalfVsync|DualRampAnimatorOpt) printf '%s' '这是策略开关；开启让对应逻辑参与，关闭只停用这一层，不会自动关闭其他亮度限制或保护。' ;;
+    *)
+      case "$impact_unit" in
+        nit) printf '%s' '该值以 nit 描述亮度坐标或上限；提高通常移动到更高亮度或放宽上限，降低通常变暗，但必须结合来源节点的触发条件理解。' ;;
+        lux) printf '%s' '该值影响环境照度判断而非直接亮度；提高通常推迟条件触发，降低通常使条件更早触发。' ;;
+        ratio|percent) printf '%s' '该比例改变增强或降亮幅度；方向由对应策略定义，最终仍受更高优先级上限限制。' ;;
+        package) printf '%s' '该名单只决定策略对象，不直接写入亮度值；包名匹配后才会使用同组参数。' ;;
+        *) printf '%s' '该项由对应厂商显示服务读取；若不是明确的 nit、Lux 或比例，不能简单按数值越大屏幕越亮解释。' ;;
+      esac
+      ;;
+  esac
+}
+
+emit_setting() {
+  key=$1 raw=$2 comment=$3 unit=$4 source=$5 range=$6
+  impact_note=$(setting_impact_note "$key" "$unit")
+  comment="$comment $impact_note"
+  printf '  "%s":{"value":%s,"_comment":"%s","unit":"%s","source":"%s","original":%s,"safe_range":%s},\n' \
+    "$key" "$raw" "$comment" "$unit" "$source" "$raw" "$range"
+}
+
+format_config_by_page() {
+  file=$1
+  out="$file.formatted.$$"
+  awk '
+    function getkey(line, s){s=line;sub(/^[[:space:]]*"/,"",s);sub(/".*/,"",s);return s}
+    function groupof(k) {
+      if(k=="schema_version"||k=="device_fingerprint"||k=="target_etc"||k=="brightness_file"||k=="apollo_file"||k=="sensor_file"||k=="app_policy_original_max"||k=="safe_nit_max"||k=="panel_mapping_max_nit"||k=="panel_mapping_max_dbv"||k=="mapping_relationship"||k=="mapping_relationship_stats")return 1
+      if(k=="manual_max_level"||k=="auto_curve")return 2
+      if(k~/^hbm_/)return 3
+      if(k~/^method4_/||k~/^game_/||k=="adfr_apps")return 5
+      if(k=="voltage_matrix"||k=="force_temperature_limit"||k=="dolby_temperature_nits")return 6
+      if(k~/^(global_|uir_|foss|method[2368]_|window_)/)return 4
+      if(k~/^(dark_env_|light_sensor_|BrightnessHalfVsync|DualRampAnimatorOpt|dual_light_|comfortable_|backlight_|adfr_|dbi_)/)return 7
+      if(k~/^mapping_/)return 8
+      if(k~/^(demura_|eyeprotect_|dbvgain_)/)return 9
+      if(k~/^unsafe_/)return 10
+      return 11
+    }
+    /^  "[^"]+":\{"value":/ {k=getkey($0);g=groupof(k);row[g,++count[g]]=$0;next}
+    END {
+      print "{"
+      first=1
+      for(g=1;g<=11;g++)if(count[g]){
+        if(!first)print ""
+        for(i=1;i<=count[g];i++)print row[g,i]
+        first=0
+      }
+      print "  \"_end\":true"
+      print "}"
+    }
+  ' "$file" > "$out" || { rm -f "$out"; return 1; }
+  mv -f "$out" "$file"
+}
+
+create_config() {
+  [ -d "$ORIGINAL" ] || { echo "create_config E_ORIGINAL_DIR: $ORIGINAL 不存在" >&2; return 1; }
+  BFILE=$(cat "$STATE/brightness_file" 2>/dev/null)
+  AFILE=$(cat "$STATE/apollo_file" 2>/dev/null)
+  SFILE=$(cat "$STATE/sensor_file" 2>/dev/null)
+  [ -f "$ORIGINAL/$BFILE" ] || { echo "create_config E_BRIGHTNESS_SNAPSHOT: $BFILE" >&2; return 1; }
+  [ -f "$ORIGINAL/$AFILE" ] || { echo "create_config E_APOLLO_SNAPSHOT: $AFILE" >&2; return 1; }
+  [ -f "$ORIGINAL/$SFILE" ] || { echo "create_config E_SENSOR_SNAPSHOT: $SFILE" >&2; return 1; }
+
+  APP="$ORIGINAL/display_brightness_app_list.xml"
+  UIR="$ORIGINAL/multimedia_display_uir_config.xml"
+  AUTO="$ORIGINAL/multimedia_display_brightness_config.xml"
+  VOLT="$ORIGINAL/multimedia_display_voltage_limit.xml"
+  ADFR="$ORIGINAL/multimedia_display_adfr2minfps_config.xml"
+  DBI="$ORIGINAL/multimedia_display_dbi_config.xml"
+  DEMURA="$ORIGINAL/multimedia_display_demura_config.xml"
+  DBV=$(find "$ORIGINAL" -maxdepth 1 -name 'display_dbvgain_config_panel_*.xml' | head -n 1)
+
+  manual=$(xml_attr "$ORIGINAL/$BFILE" brightness_table max)
+  last_level=$(awk -F',' '/<level>/{s=$1;sub(/^.*<level>/,"",s);gsub(/[[:space:]]/,"",s);if(s+0>m)m=s+0} END{print m+0}' "$ORIGINAL/$BFILE")
+  map_nit=$(awk -F',' '/<Level>/{s=$NF;sub(/<\/Level>.*/,"",s);gsub(/[[:space:]]/,"",s);if(s+0>m)m=s+0} END{printf "%.3f",m}' "$ORIGINAL/$AFILE")
+  map_dbv=$(awk -F',' '/<Level>/{s=$2;gsub(/[[:space:]]/,"",s);if(s+0>m)m=s+0} END{print m+0}' "$ORIGINAL/$AFILE")
+  appmax=$(awk '
+    /<method id=/ {method=1} /<\/method>/ {method=0}
+    /<game_edr>/ {game=1} /<\/game_edr>/ {game=0}
+    (method||game) && /<nit|_nit/ {s=$0;gsub(/<[^>]+>/," ",s);gsub(/[^0-9.]+/," ",s);n=split(s,a," ");for(i=1;i<=n;i++)if(a[i]+0>m)m=a[i]+0}
+    END{print m+0}' "$APP")
+  [ "$appmax" -gt 0 ] || appmax=2000
+  safe_max=$(awk -v n="$appmax" 'BEGIN{printf "%d",n*1.2+0.5}')
+  curve=$(auto_curve_json "$AUTO")
+  fingerprint=$(getprop ro.build.fingerprint 2>/dev/null)
+  [ -n "$fingerprint" ] || fingerprint=unknown
+
+  mapping_record=$(cat "$STATE/mapping_relationship" 2>/dev/null)
+  [ -n "$mapping_record" ] || { echo "create_config E_MAPPING_STATE_MISSING: $STATE/mapping_relationship" >&2; return 1; }
+  mapping_relationship=$(printf '%s\n' "$mapping_record" | awk -F'|' 'NR==1{print $1;exit}')
+  case "$mapping_relationship" in
+    linked_equal) mapping_edit_mode=linked ;;
+    separate_nit) mapping_edit_mode=separate ;;
+    *) echo "create_config E_MAPPING_STATE_VALUE: $mapping_record" >&2; return 1 ;;
+  esac
+  # The installer has already validated all six fields. Keep the raw record in
+  # JSON so initialization does not depend on shell-specific empty-field/IFS
+  # behavior, and so diagnostics can be compared byte-for-byte.
+  mapping_summary=$mapping_record
+  echo "create_config mapping_state=$mapping_record"
+
+  tmp="$CONFIG.new"
+  {
+    echo '{'
+    emit_setting schema_version '3' '配置格式版本，请勿修改。' '' internal '[3,3]'
+    emit_setting device_fingerprint "$(json_quote "$fingerprint")" '生成原厂快照时的系统指纹；跨系统导入时用于保护硬件标定。' '' system 'null'
+    emit_setting target_etc '"/my_product/vendor/etc"' '目标系统目录；首版固定为该路径。' '' system 'null'
+    emit_setting brightness_file "$(json_quote "$BFILE")" '自动探测到的亮度表文件。' '' system 'null'
+    emit_setting apollo_file "$(json_quote "$AFILE")" '自动探测到的 Apollo 映射文件。' '' system 'null'
+    emit_setting sensor_file "$(json_quote "$SFILE")" '自动探测到的传感器和 HBM 文件。' '' system 'null'
+    emit_setting app_policy_original_max "$appmax" '原厂应用名单和应用策略中最大的显式 nit，用于计算普通模式软上限。' nit "$APP" '[0,9999]'
+    emit_setting safe_nit_max "$safe_max" '普通模式统一软上限，等于原厂应用策略最大值乘以 1.20。' nit computed "[0,$safe_max]"
+    emit_setting panel_mapping_max_nit "$map_nit" '原厂 Apollo 表声明的最高映射 nit；它不是实测值。' nit "$AFILE" '[0,9999]'
+    emit_setting panel_mapping_max_dbv "$map_dbv" '原厂 Apollo 表最高 DBV；12 位结构硬上限为 4095。' dbv "$AFILE" '[0,4095]'
+    emit_setting mapping_relationship "$(json_quote "$mapping_relationship")" '安装时逐行比较得到的 Brightness/Apollo 关系。linked_equal 表示逻辑 Level 与 nit 全部一一对应且相等；separate_nit 表示 Level 对齐但 nit 不同。该项只读。' relationship "$BFILE;$AFILE" 'null'
+    emit_setting mapping_relationship_stats "$(json_quote "$mapping_summary")" '安装期比较统计：总行数、nit 不同数、唯一 DBV 数、共用 DBV 的分组数和最大组大小。该项只读。' diagnostic "$BFILE;$AFILE" 'null'
+    emit_setting manual_max_level "$manual" '手动亮度滑块可到达的最高逻辑等级；普通模式只能选择原厂表已有等级。' level "$BFILE/brightness_table@max" "[2,$last_level]"
+    emit_setting auto_curve "$curve" '自动亮度 Lux 到 nit 坐标。Lux 必须递增，nit 不得下降。' lux_nit "$AUTO/lux_table" "[0,$safe_max]"
+    echo
+    emit_setting hbm_lux "$(json_quote "$(xml_value "$ORIGINAL/$SFILE" Hbm_Lux)")" '进入 HBM 的环境照度门限；保留前导零格式。' lux "$SFILE/Hbm_Lux" '[0,1000000]'
+    emit_setting hbm_cct "$(json_quote "$(xml_value "$ORIGINAL/$SFILE" Hbm_Cct)")" 'HBM 智能色温算法使用的 CCT 条件；具体编码由厂商服务解释。' raw "$SFILE/Hbm_Cct" 'null'
+    emit_setting hbm_lux_table_mode "$(xml_value "$ORIGINAL/$BFILE" hbm_lux_table_mode)" 'HBM 使用的厂商曲线模式编号，不是亮度值。' mode "$BFILE/hbm_lux_table_mode" '[0,255]'
+    echo
+
+    emit_setting global_limit "$(xml_attr "$APP" global_brightness_limit nit)" '除例外名单外所有应用的全局亮度上限。' nit 'display_brightness_app_list.xml/global_brightness_limit' "[0,$safe_max]"
+    emit_setting global_exceptions "$(apps_from_scope "$APP" global 0 | json_string_array)" '不受全局应用上限约束的例外包名；清空后所有应用都受限。' package 'display_brightness_app_list.xml/global_brightness_limit/app' 'null'
+    emit_setting uir_enable "$(xml_value "$UIR" uir_enable)" 'UIR 总开关。UIR 是名单内应用的厂商显示增强策略。' bool 'multimedia_display_uir_config.xml/uir_enable' '[0,1]'
+    emit_setting uir_brightness_limit "$(xml_value "$UIR" brightness_nit_limit)" 'UIR 亮度触发门限，不等同于面板物理峰值。' nit 'multimedia_display_uir_config.xml/brightness_nit_limit' "[0,$safe_max]"
+    emit_setting uir_temperature_limit "$(xml_value "$UIR" temperature_limit)" 'UIR 温度门限；提高该值会放宽温控，只能在危险模式应用。' milli_celsius 'multimedia_display_uir_config.xml/temperature_limit' '[0,100000]'
+    emit_setting uir_max_ratio "$(xml_value "$UIR" max_ratio)" 'UIR 最大增强比例，厂商以百分比刻度解释。' percent 'multimedia_display_uir_config.xml/max_ratio' '[0,1000]'
+    emit_setting uir_apps "$(apps_from_scope "$UIR" uir 0 | json_string_array)" '允许触发 UIR 的应用包名。' package 'multimedia_display_uir_config.xml/app_list' 'null'
+    for id in 2 4; do
+      emit_setting "foss${id}_apps" "$(apps_from_scope "$APP" foss "$id" | json_string_array)" "FOSS type $id 的应用名单；进入应用时按该组比例降亮。" package "display_brightness_app_list.xml/foss/type@$id" 'null'
+      emit_setting "foss${id}_switch" "$(scope_value "$APP" foss "$id" switch '')" "FOSS type $id 开关。" bool "display_brightness_app_list.xml/foss/type@$id/switch" '[0,1]'
+      emit_setting "foss${id}_ratio" "$(scope_value "$APP" foss "$id" ratio '')" "FOSS type $id 降亮比例；0 表示不降亮。" ratio "display_brightness_app_list.xml/foss/type@$id/ratio" '[0,1]'
+    done
+    emit_setting foss_enable "$(xml_attr "$APP" foss enable)" 'FOSS 应用降亮功能总开关。' bool 'display_brightness_app_list.xml/foss@enable' '[0,1]'
+
+    for id in 2 3 4 6 8; do
+      emit_setting "method${id}_apps" "$(apps_from_scope "$APP" method "$id" | json_string_array)" "method $id 应用名单；method 4 是游戏名单。" package "display_brightness_app_list.xml/method@$id/app" 'null'
+      emit_setting "method${id}_switch" "$(scope_value "$APP" method "$id" switch '')" "method $id 场景策略开关。" bool "display_brightness_app_list.xml/method@$id/switch" '[0,1]'
+      for mode in 0 1; do
+        for tag in nit ratio rate_in rate_out; do
+          value=$(scope_value "$APP" method "$id" "$tag" "$mode")
+          raw=$(csv_json "$value")
+          unit=$tag; range='null'; [ "$tag" = nit ] && unit=nit && range="[0,$safe_max]"
+          emit_setting "method${id}_${tag}${mode}" "$raw" "method $id、mode $mode 的 $tag 坐标；四组数组长度必须一致。" "$unit" "display_brightness_app_list.xml/method@$id/$tag@$mode" "$range"
+        done
+      done
+    done
+
+    emit_setting window_limit "$(xml_value "$APP" limitnit)" '窗口亮度名单的最大 nit；常用于二维码、交通卡等窗口。' nit 'display_brightness_app_list.xml/window_brightness/limitnit' "[0,$safe_max]"
+    emit_setting window_apps "$(apps_from_scope "$APP" window 0 | json_string_array)" '触发窗口亮度上限的应用包名。' package 'display_brightness_app_list.xml/window_brightness/app' 'null'
+    emit_setting game_brightness_nit "$(csv_json "$(section_value "$APP" game_brightness nit)")" '游戏亮度策略的 nit 坐标；该节点不是游戏 EDR。' nit 'display_brightness_app_list.xml/game_brightness/nit' "[0,$safe_max]"
+    emit_setting game_brightness_ratio "$(csv_json "$(section_value "$APP" game_brightness ratio)")" '游戏亮度策略对应的调整比例。' ratio 'display_brightness_app_list.xml/game_brightness/ratio' 'null'
+    emit_setting game_brightness_rate "$(csv_json "$(section_value "$APP" game_brightness rate)")" '游戏亮度策略的过渡速率。' rate 'display_brightness_app_list.xml/game_brightness/rate' 'null'
+    for factor in 25 27; do
+      emit_setting "game_edr_${factor}_origin" "$(csv_json "$(xml_tag_attr_text "$APP" origin_nit factor "$factor")")" "factor $factor 的全局游戏 EDR 原始亮度曲线，所有名单内游戏共用。" nit "display_brightness_app_list.xml/game_edr/origin_nit@$factor" "[0,$safe_max]"
+      emit_setting "game_edr_${factor}_enhance" "$(csv_json "$(xml_tag_attr_text "$APP" enhance_nit factor "$factor")")" "factor $factor 的全局游戏 EDR 增强曲线，所有名单内游戏共用。" nit "display_brightness_app_list.xml/game_edr/enhance_nit@$factor" "[0,$safe_max]"
+    done
+
+    emit_setting dolby_temperature_nits "$(awk '/<dolby_temperature_limit_nit>/{a=1;printf "[";f=1;next} a&&/<\/dolby_temperature_limit_nit>/{print "]";exit} a&&/<nits>/{s=$0;sub(/^.*<nits>/,"",s);sub(/<\/nits>.*$/,"",s);if(!f)printf ",";printf "%s",s;f=0}' "$APP")" 'Dolby 温控 0 至 21 档亮度上限；9999 通常表示不限制。' nit 'display_brightness_app_list.xml/dolby_temperature_limit_nit' 'null'
+    emit_setting force_temperature_limit "$(xml_value "$APP" force_control_temperature_limit)" '显示强制温控阈值；提高会放宽保护，必须开启危险模式。' celsius 'display_brightness_app_list.xml/force_control_temperature_limit' '[0,100]'
+    emit_setting dark_env_support "$(section_value "$APP" DarkEnvReduceBrightness support)" '暗环境额外降亮功能开关。' bool 'display_brightness_app_list.xml/DarkEnvReduceBrightness/support' '[0,1]'
+    emit_setting dark_env_lux "$(csv_json "$(section_value "$APP" DarkEnvReduceBrightness lux)")" '暗环境降亮的 Lux 坐标。' lux 'display_brightness_app_list.xml/DarkEnvReduceBrightness/lux' 'null'
+    emit_setting dark_env_scale "$(csv_json "$(section_value "$APP" DarkEnvReduceBrightness scale)")" '暗环境各坐标对应的降亮比例。' ratio 'display_brightness_app_list.xml/DarkEnvReduceBrightness/scale' '[0,1]'
+    for tag in light_sensor_always_on_support BrightnessHalfVsync DualRampAnimatorOpt dual_light_sensor_fusion_support dark_env_brightness_smooth_optimize_support; do
+      emit_setting "$tag" "$(xml_value "$APP" "$tag")" "$tag 厂商显示联动开关；可能影响光感功耗、动画或暗光稳定性。" bool "display_brightness_app_list.xml/$tag" '[0,1]'
+    done
+    comfort=$(awk '/MotionMode(InTransportation|OnFoot)LuxThreshold>/{s=$0;sub(/^[^>]*>/,"",s);sub(/<\/.*$/,"",s);a[++n]=s} END{printf "[";for(i=1;i<=n;i++){if(i>1)printf ",";printf "%s",a[i]}print "]"}' "$APP")
+    emit_setting comfortable_motion_support "$(xml_value "$APP" MotionModeSupport)" '舒适亮度的运动状态识别开关。' bool 'display_brightness_app_list.xml/comfortable_brightness/MotionModeSupport' '[0,1]'
+    emit_setting comfortable_thresholds "$comfort" '依次为 normal、erratic、stable 场景下交通和步行 Lux 阈值。' lux 'display_brightness_app_list.xml/comfortable_brightness/scene' 'null'
+    emit_setting backlight_luxs "$(csv_json "$(xml_value "$APP" luxs)")" '亮度统计使用的 Lux 桶；只影响统计和上报。' lux 'display_brightness_app_list.xml/backlightStat/luxs' 'null'
+    emit_setting backlight_app_levels "$(csv_json "$(xml_value "$APP" appLevels)")" '亮度统计应用层级；不直接控制面板。' nit 'display_brightness_app_list.xml/backlightStat/appLevels' 'null'
+    emit_setting backlight_dur_levels "$(csv_json "$(xml_value "$APP" durLevels)")" '亮度持续时间统计分档。' nit 'display_brightness_app_list.xml/backlightStat/durLevels' 'null'
+    emit_setting backlight_max_lux "$(xml_value "$APP" maxLux)" '亮度统计最大 Lux；不直接控制屏幕亮度。' lux 'display_brightness_app_list.xml/backlightStat/maxLux' 'null'
+
+    emit_setting voltage_profile_name "$(json_quote "$(xml_attr "$VOLT" lowvoltage_brightness_limit name)")" '低温低压矩阵对应的面板配置名；由原厂文件读取。' profile 'multimedia_display_voltage_limit.xml/lowvoltage_brightness_limit@name' 'null'
+    emit_setting voltage_matrix "$(voltage_json "$VOLT")" '每行格式为温度范围|电量范围=普通nit,复合nit；提高上限属于放宽保护。' matrix 'multimedia_display_voltage_limit.xml' 'null'
+
+    if [ -f "$ADFR" ]; then
+      for tag in panelnit_enable sensor_inlux sensor_outlux panelnit_level aod_panelnit_level; do
+        val=$(xml_value "$ADFR" "$tag"); [ -n "$val" ] || val=0
+        if printf '%s' "$val" | grep -q ' '; then raw=$(json_quote "$val"); else raw=$val; fi
+        emit_setting "adfr_$tag" "$raw" "$tag 控制 ADFR 最低刷新率判断，不直接提高亮度。" linked "multimedia_display_adfr2minfps_config.xml/$tag" 'null'
+      done
+      emit_setting adfr_apps "$(simple_apps_json "$ADFR")" 'ADFR 刷新率联动应用名单，与 method 4 游戏亮度名单相互独立。' package 'multimedia_display_adfr2minfps_config.xml/app_list' 'null'
+    else
+      emit_setting adfr_apps '[]' '该设备没有 ADFR 配置。' package unavailable 'null'
+    fi
+
+    if [ -f "$DBI" ]; then
+      emit_setting dbi_enable "$(xml_value "$DBI" dbi_enable)" 'DBI 功能总开关；它是显示联动能力，不等同于峰值亮度。' bool 'multimedia_display_dbi_config.xml/dbi_enable' '[0,1]'
+      emit_setting dbi_app_list_enable "$(xml_attr "$DBI" app_list enable)" '是否仅统计 DBI 名单应用。' bool 'multimedia_display_dbi_config.xml/app_list@enable' '[0,1]'
+      emit_setting dbi_apps "$(apps_from_scope "$DBI" dbi 0 | json_string_array)" 'DBI 应用名单。' package 'multimedia_display_dbi_config.xml/app_list' 'null'
+      emit_setting dbi_capture_interval "$(xml_value "$DBI" capture_interval)" 'DBI 采集间隔；减小会增加统计开销。' seconds 'multimedia_display_dbi_config.xml/capture_interval' '[1,3600]'
+    fi
+
+    if [ -f "$DEMURA" ]; then
+      emit_setting demura_global_status "$(xml_value "$DEMURA" DemuraGlobalStatus)" 'Demura 全局开关；错误修改可能导致均匀性或色彩异常。' bool 'multimedia_display_demura_config.xml/DemuraGlobalStatus' '[0,1]'
+      emit_setting demura_global_gain "$(xml_value "$DEMURA" DemuraGlobalGain)" 'Demura 全局增益，只能在危险模式修改。' gain 'multimedia_display_demura_config.xml/DemuraGlobalGain' '[0,4]'
+    fi
+    panel_demura=$(find "$ORIGINAL" -maxdepth 1 -name 'display_demura_config_panel_*.xml' | head -n 1)
+    if [ -f "$panel_demura" ]; then
+      aoi=$(awk '/<aoi>/{a=1;next} a&&/<\/aoi>/{exit} a&&/<dbv nit=/{s=$0;n=s;sub(/^.*nit="/,"",n);sub(/".*$/,"",n);sub(/^[^>]*>/,"",s);sub(/<\/dbv>.*$/,"",s);print n "=" s}' "$panel_demura" | json_string_array)
+      emit_setting demura_aoi "$aoi" '面板 AOI 的 nit=DBV 锚点；DBV 必须不超过 4095。' nit_dbv "$(basename "$panel_demura")/aoi" 'null'
+    else
+      emit_setting demura_aoi '[]' '该设备没有面板 AOI Demura 文件。' nit_dbv unavailable 'null'
+    fi
+
+    emit_setting eyeprotect_profiles "$(eyeprotect_json)" '每项为文件|默认色温|色温数组|红|绿|蓝；数组长度必须相同。' calibration 'EyeProtect/*.xml' 'null'
+    if [ -f "$DBV" ]; then
+      emit_setting dbvgain_entries "$(dbvgain_json "$DBV")" '每项为 fps|id|dbv|R Gamma|G Gamma|B Gamma；修改需要危险模式。' calibration "$(basename "$DBV")" 'null'
+    else
+      emit_setting dbvgain_entries '[]' '该设备没有 DBV/Gamma 配置。' calibration unavailable 'null'
+    fi
+    emit_setting mapping_nit_multiplier '1' '对 brightness_table 和 Apollo 原厂 nit 映射统一乘以该系数；修改需要危险模式。倍率始终基于原厂快照计算，不会重复累积。' multiplier "$BFILE;$AFILE" '[0.01,10]'
+    emit_setting mapping_dbv_multiplier '1' '对 Apollo DBV 映射统一乘以该系数并四舍五入为整数；修改需要危险模式，结果仍不得超过 4095。' multiplier "$AFILE" '[0.01,10]'
+    emit_setting mapping_edit_mode "$(json_quote "$mapping_edit_mode")" 'linked 将同一 Level 的 brightness nit 与 Apollo nit 合并为一个值；separate 允许两者不同。原厂相等时强制分开需要危险模式并可能造成请求与驱动映射不一致。' mode "$BFILE;$AFILE" 'null'
+    emit_setting mapping_shared_dbv_propagation 'true' '修改 Apollo DBV 时，同步修改所有原厂共用该 DBV 的逻辑 Level，包括当前 Level 前面的等级；关闭会拆散同一物理 DBV 分级并可能造成跳变。' bool "$AFILE" '[false,true]'
+    emit_setting mapping_overrides '[]' '危险模式下覆盖单行最终值，格式 level|dbv|brightness_nit|apollo_nit；兼容旧的 level|dbv|nit。linked 模式要求两个 nit 相同；DBV 共用分组默认由编译器自动传播。' calibration "$BFILE;$AFILE" 'null'
+    echo
+    emit_setting unsafe_mode 'false' '危险模式会解除原厂应用策略最大值加 20% 的软限制及温控保护限制；结构硬限制仍然有效。安装升级、WebUI 页面切换、导入和恢复亮度默认值都会保留当前解锁状态。' '' settings '[false,true]'
+    emit_setting unsafe_acknowledgement '""' '危险模式确认令牌。WebUI 点击确认后会自动写入 I_UNDERSTAND_THE_RISK；手动用户也必须填写该 ASCII 令牌。' '' settings 'null'
+    echo '  "_end":true'
+    echo '}'
+  } > "$tmp" || { echo "create_config E_WRITE_TEMPLATE: $tmp" >&2; rm -f "$tmp"; return 1; }
+  format_config_by_page "$tmp" || { echo "create_config E_FORMAT_TEMPLATE: $tmp" >&2; rm -f "$tmp"; return 1; }
+
+  preserve_old=false
+  if [ -f "$CONFIG" ]; then
+    old_fingerprint=$(cfg_scalar device_fingerprint)
+    [ -n "$old_fingerprint" ] && [ "$old_fingerprint" = "$fingerprint" ] && preserve_old=true
+  fi
+  cp -af "$tmp" "$DEFAULTS" || { echo "create_config E_WRITE_DEFAULTS: $DEFAULTS" >&2; rm -f "$tmp"; return 1; }
+  if [ "$preserve_old" = true ]; then
+    migrated="$CONFIG.migrated.$$"
+    if awk '
+      function getkey(line, s){s=line;sub(/^[[:space:]]*"/,"",s);sub(/".*/,"",s);return s}
+      NR==FNR && /^  "[^"]+":\{"value":/ {
+        key=getkey($0)
+        if(key!="schema_version"&&key!="device_fingerprint"&&key!="target_etc"&&key!="brightness_file"&&key!="apollo_file"&&key!="sensor_file"&&key!="app_policy_original_max"&&key!="safe_nit_max"&&key!="panel_mapping_max_nit"&&key!="panel_mapping_max_dbv"&&key!="mapping_relationship"&&key!="mapping_relationship_stats") {
+          s=$0;sub(/^.*"value":/,"",s);sub(/,"_comment":.*$/,"",s);saved[key]=s
+        }
+        next
+      }
+      FNR!=NR && /^  "[^"]+":\{"value":/ {
+        key=getkey($0)
+        if(key in saved){
+          q=sprintf("%c",34);valuemark=q "value" q ":";commentmark="," q "_comment" q ":"
+          vp=index($0,valuemark);cp=index($0,commentmark)
+          if(!vp||!cp||cp<=vp)exit 8
+          print substr($0,1,vp+length(valuemark)-1) saved[key] substr($0,cp)
+          next
+        }
+      }
+      FNR!=NR {print}
+    ' "$CONFIG" "$tmp" > "$migrated"; then
+      mv -f "$migrated" "$CONFIG" || { echo "create_config E_INSTALL_MIGRATION: $CONFIG" >&2; rm -f "$migrated" "$tmp"; return 1; }
+      echo "create_config preserved compatible existing values"
+    else
+      migration_backup="$BACKUPS/config-pre-migration-failed-$(date +%Y%m%d-%H%M%S 2>/dev/null).json"
+      cp -af "$CONFIG" "$migration_backup" 2>/dev/null
+      rm -f "$migrated"
+      cp -af "$tmp" "$CONFIG" || { echo "create_config E_MIGRATION_FALLBACK_WRITE: $CONFIG" >&2; rm -f "$tmp"; return 1; }
+      echo "create_config warning: old JSON migration failed; factory config used, old JSON backup=$migration_backup"
+    fi
+  else
+    cp -af "$tmp" "$CONFIG" || { echo "create_config E_WRITE_CONFIG: $CONFIG" >&2; rm -f "$tmp"; return 1; }
+  fi
+  rm -f "$tmp"
+
+  # Schema 2 already allowed four-column independent row overrides. Preserve
+  # such an upgrade without silently forcing Apollo nit back to brightness nit.
+  if [ "$mapping_relationship" = linked_equal ] && cfg_raw mapping_overrides | json_array_strings | awk -F'|' '
+    NF>=4 {d=$3-$4;if(d<0)d=-d;if(d>0.0005){found=1;exit}} END{exit !found}
+  '; then
+    set_cfg_raw mapping_edit_mode '"separate"' || { echo "create_config E_UPGRADE_SEPARATE_MODE" >&2; return 1; }
+    echo '检测到旧配置含独立 Brightness/Apollo nit，升级后保留为 separate 编辑模式'
+  fi
+
+  (cd "$ORIGINAL" && find . -type f -name '*.xml' -print | sort | while IFS= read -r f; do sha256sum "$f"; done) > "$STATE/original.sha256" || { echo "create_config E_HASH_SNAPSHOT" >&2; return 1; }
+  printf '%s\n' "$safe_max" > "$STATE/safe_nit_max" || { echo "create_config E_WRITE_SAFE_MAX" >&2; return 1; }
+  printf '%s\n' "$map_nit" > "$STATE/panel_mapping_max_nit" || { echo "create_config E_WRITE_MAP_MAX" >&2; return 1; }
+  echo "create_config completed"
+  return 0
+}
+
+usage() {
+  echo "usage: configctl init|validate|apply [--no-mount|--boot]|apply-import FILE|queue-apply FILE JOB|job-status JOB|mapping-data|read-config|status|installed-apps|backup|restore-defaults|export|verify-mounts|update-description"
+}
+
+restore_defaults_preserve_unlock() {
+  previous_unsafe=$(cfg_raw unsafe_mode)
+  previous_ack=$(cfg_raw unsafe_acknowledgement)
+  cp -af "$DEFAULTS" "$CONFIG" || return 1
+  [ -n "$previous_unsafe" ] && set_cfg_raw unsafe_mode "$previous_unsafe"
+  [ -n "$previous_ack" ] && set_cfg_raw unsafe_acknowledgement "$previous_ack"
+  echo "已恢复全部原厂默认值；危险模式解锁状态保持不变，请再次应用"
+}
+
+cmd=${1:-}
+case "$cmd" in
+  init)
+    : > "$LOGDIR/install.log"
+    {
+      echo "init start module=$MODDIR pid=$$"
+      echo "init shell=$(readlink /proc/$$/exe 2>/dev/null)"
+      echo "init config=$CONFIG original=$ORIGINAL state=$STATE"
+      echo "init mapping_state=$(cat "$STATE/mapping_relationship" 2>/dev/null)"
+      echo "init managed_count=$(wc -l < "$STATE/managed_files.list" 2>/dev/null)"
+      ls -ld "$MODDIR" "$ORIGINAL" "$STATE" "$MODDIR/config" 2>&1
+      ls -l "$STATE/brightness_file" "$STATE/apollo_file" "$STATE/sensor_file" "$STATE/mapping_relationship" 2>&1
+    } >> "$LOGDIR/install.log" 2>&1
+    if create_config >> "$LOGDIR/install.log" 2>&1; then
+      echo "原厂默认配置已生成: $CONFIG"
+      exit 0
+    fi
+    echo "生成默认配置失败" >&2
+    exit 10
+    ;;
+  read-config) cat "$CONFIG"; exit $? ;;
+  status) [ -f "$STATE/status.json" ] && cat "$STATE/status.json" || echo '{"state":"not_initialized"}'; exit 0 ;;
+  installed-apps)
+    echo '# user'; pm list packages -3 2>/dev/null | sed 's/^package://'
+    echo '# system'; pm list packages -s 2>/dev/null | sed 's/^package://'
+    exit 0
+    ;;
+esac
+
+# Remaining commands are implemented below this dispatch section.
+
+raw_csv() {
+  cfg_raw "$1" | sed 's/^\[//;s/\]$//;s/[[:space:]]//g'
+}
+
+is_changed() {
+  [ "$(cfg_raw "$1")" != "$(cfg_original "$1")" ]
+}
+
+array_count() {
+  cfg_numbers "$1" | awk 'END{print NR+0}'
+}
+
+max_numbers() {
+  cfg_numbers "$1" | awk '$1+0>m{m=$1+0} END{print m+0}'
+}
+
+validate_packages() {
+  key=$1
+  tmp="$STATE/.packages.$$"
+  cfg_raw "$key" | json_array_strings > "$tmp" || return 1
+  while IFS= read -r pkg; do
+    [ -z "$pkg" ] && continue
+    printf '%s\n' "$pkg" | grep -Eq '^[A-Za-z0-9_]+([.][A-Za-z0-9_]+)+$' || {
+      echo "$key 包名格式错误: $pkg" >&2; rm -f "$tmp"; return 1;
+    }
+  done < "$tmp"
+  dup=$(sort "$tmp" | uniq -d | head -n 1)
+  rm -f "$tmp"
+  [ -z "$dup" ] || { echo "$key 存在重复包名: $dup" >&2; return 1; }
+}
+
+validate_auto_curve() {
+  cfg_raw auto_curve | awk '
+    {
+      s=$0; gsub(/\[/,"",s); gsub(/\]/,"",s); gsub(/[[:space:]]/,"",s); n=split(s,a,",")
+      if (n<4 || n%2) exit 1
+      for(i=1;i<=n;i+=2) {
+        x=a[i]+0; y=a[i+1]+0
+        if (i>1 && x<=px) exit 2
+        if (i>1 && y<py) exit 3
+        if (x<0 || y<0) exit 4
+        px=x; py=y
+      }
+    }
+  '
+}
+
+validate_voltage_protection() {
+  # Normal mode may keep or lower nit caps, but may not raise either value.
+  current="$STATE/.volt.current.$$"; original="$STATE/.volt.original.$$"
+  cfg_raw voltage_matrix | json_array_strings > "$current"
+  cfg_original voltage_matrix | json_array_strings > "$original"
+  awk -F'|' '
+    NR==FNR { old[FNR]=$0; oldn=FNR; next }
+    {
+      if (!(FNR in old)) exit 1
+      on=split(old[FNR],o,"|"); nn=split($0,n,"|")
+      if (on!=nn) exit 1
+      for(i=2;i<=on;i++) {
+        split(o[i],oa,"="); split(n[i],na,"="); if(oa[1]!=na[1]) exit 1
+        split(oa[2],ov,","); split(na[2],nv,",")
+        if(nv[1]+0>ov[1]+0 || nv[2]+0>ov[2]+0) exit 2
+      }
+    }
+    END { if(FNR!=oldn) exit 1 }
+  ' "$original" "$current"
+  rc=$?; rm -f "$current" "$original"; return $rc
+}
+
+validate_array_not_raise() {
+  key=$1
+  current="$STATE/.array.current.$$"; original="$STATE/.array.original.$$"
+  cfg_numbers "$key" > "$current"; cfg_original "$key" | tr -d '[][:space:]' | tr ',' '\n' | sed '/^$/d' > "$original"
+  awk 'NR==FNR{old[FNR]=$1;oldn=FNR;next}{if(!(FNR in old)||$1+0>old[FNR]+0)exit 1}END{if(FNR!=oldn)exit 1}' "$original" "$current"
+  rc=$?; rm -f "$current" "$original"; return $rc
+}
+
+validate_range() {
+  key=$1 min=$2 max=$3
+  cfg_numbers "$key" | awk -v min="$min" -v max="$max" '$1+0<min||$1+0>max{exit 1}'
+}
+
+validate_config() {
+  [ -s "$CONFIG" ] || { echo "配置文件不存在或为空" >&2; return 1; }
+  head -n 1 "$CONFIG" | grep -q '^[[:space:]]*{[[:space:]]*$' || { echo "JSON 起始格式错误" >&2; return 1; }
+  tail -n 1 "$CONFIG" | grep -q '^[[:space:]]*}[[:space:]]*$' || { echo "JSON 结束格式错误" >&2; return 1; }
+  grep -q '^  "_end":true' "$CONFIG" || { echo "配置必须由 WebUI 或 configctl 以规范 JSON 格式保存" >&2; return 1; }
+  awk '
+    /^  "[^"]+":\{"value":/ {
+      s=$0; sub(/^.*"value":/,"",s); sub(/,"_comment":.*$/,"",s)
+      if(s=="" || s !~ /^(null|true|false|[-0-9]|"|\[|\{)/) { print "非法 JSON value: " $0 > "/dev/stderr"; exit 1 }
+    }
+  ' "$CONFIG" || return 1
+
+  for key in schema_version unsafe_mode manual_max_level auto_curve hbm_lux hbm_cct global_limit \
+    global_exceptions uir_enable uir_brightness_limit voltage_matrix eyeprotect_profiles dbvgain_entries \
+    mapping_relationship mapping_relationship_stats mapping_edit_mode mapping_shared_dbv_propagation \
+    mapping_nit_multiplier mapping_dbv_multiplier mapping_overrides; do
+    [ -n "$(cfg_raw "$key")" ] || { echo "缺少配置项: $key" >&2; return 1; }
+  done
+
+  unsafe=$(cfg_scalar unsafe_mode)
+  case "$unsafe" in true|false) ;; *) echo "unsafe_mode 必须为 true 或 false" >&2; return 1;; esac
+  if [ "$unsafe" = true ] && [ "$(cfg_scalar unsafe_acknowledgement)" != 'I_UNDERSTAND_THE_RISK' ]; then
+    echo "危险模式需要在 unsafe_acknowledgement 填写 I_UNDERSTAND_THE_RISK" >&2
+    return 1
+  fi
+
+  printf '%s\n' "$(cfg_scalar hbm_lux)" | grep -Eq '^[0-9]+$' || { echo "Hbm_Lux 必须是非负整数，可保留前导零" >&2; return 1; }
+  validate_range foss2_ratio 0 1 || { echo "FOSS type 2 ratio 必须在 0..1" >&2; return 1; }
+  validate_range foss4_ratio 0 1 || { echo "FOSS type 4 ratio 必须在 0..1" >&2; return 1; }
+
+  BFILE=$(cfg_scalar brightness_file)
+  [ -f "$ORIGINAL/$BFILE" ] || { echo "原厂亮度表不存在" >&2; return 1; }
+  manual=$(cfg_scalar manual_max_level)
+  printf '%s\n' "$manual" | grep -Eq '^[0-9]+$' || { echo "手动最大等级必须为整数" >&2; return 1; }
+  awk -F',' -v wanted="$manual" '/<level>/{s=$1;sub(/^.*<level>/,"",s);gsub(/[[:space:]]/,"",s);if(s+0==wanted){ok=1;exit}} END{exit !ok}' "$ORIGINAL/$BFILE" || {
+    echo "手动最大等级 $manual 不存在于原厂亮度表；不会自动生成未知硬件等级" >&2; return 1;
+  }
+
+  validate_auto_curve || { echo "自动亮度曲线必须至少两点、Lux 递增且 nit 不下降" >&2; return 1; }
+  safe=$(cfg_scalar safe_nit_max)
+  auto_max=$(cfg_raw auto_curve | awk '{s=$0;gsub(/\[/,"",s);gsub(/\]/,"",s);gsub(/[[:space:]]/,"",s);n=split(s,a,",");for(i=2;i<=n;i+=2)if(a[i]+0>m)m=a[i]+0}END{print m+0}')
+  if [ "$unsafe" = false ] && awk -v a="$auto_max" -v b="$safe" 'BEGIN{exit !(a>b)}'; then
+    echo "自动亮度曲线超过普通模式软上限 $safe nit" >&2; return 1
+  fi
+
+  for key in global_limit uir_brightness_limit window_limit; do
+    v=$(cfg_scalar "$key"); printf '%s\n' "$v" | grep -Eq '^[0-9]+([.][0-9]+)?$' || { echo "$key 必须为数字" >&2; return 1; }
+    if [ "$unsafe" = false ] && awk -v a="$v" -v b="$safe" 'BEGIN{exit !(a>b)}'; then
+      echo "$key 超过普通模式软上限 $safe nit" >&2; return 1
+    fi
+  done
+  for id in 2 3 4 6 8; do
+    for mode in 0 1; do
+      n=$(array_count "method${id}_nit${mode}")
+      [ "$n" -gt 0 ] || { echo "method $id mode $mode 不能为空" >&2; return 1; }
+      for tag in ratio rate_in rate_out; do
+        [ "$(array_count "method${id}_${tag}${mode}")" -eq "$n" ] || { echo "method $id mode $mode 的数组长度不一致" >&2; return 1; }
+      done
+      validate_range "method${id}_ratio${mode}" 0 1 || { echo "method $id mode $mode ratio 必须在 0..1" >&2; return 1; }
+      validate_range "method${id}_rate_in${mode}" 0 100000 || { echo "method $id mode $mode rate_in 不能为负" >&2; return 1; }
+      validate_range "method${id}_rate_out${mode}" 0 100000 || { echo "method $id mode $mode rate_out 不能为负" >&2; return 1; }
+      m=$(max_numbers "method${id}_nit${mode}")
+      if [ "$unsafe" = false ] && awk -v a="$m" -v b="$safe" 'BEGIN{exit !(a>b)}'; then echo "method $id 超过 $safe nit" >&2; return 1; fi
+    done
+  done
+
+  for key in game_brightness_nit game_edr_25_origin game_edr_25_enhance game_edr_27_origin game_edr_27_enhance; do
+    m=$(max_numbers "$key")
+    if [ "$unsafe" = false ] && awk -v a="$m" -v b="$safe" 'BEGIN{exit !(a>b)}'; then echo "$key 超过 $safe nit" >&2; return 1; fi
+  done
+  [ "$(array_count game_brightness_nit)" -eq "$(array_count game_brightness_ratio)" ] || { echo "game_brightness nit/ratio 长度不一致" >&2; return 1; }
+  [ "$(array_count game_brightness_nit)" -eq "$(array_count game_brightness_rate)" ] || { echo "game_brightness nit/rate 长度不一致" >&2; return 1; }
+  for factor in 25 27; do
+    [ "$(array_count game_edr_${factor}_origin)" -eq "$(array_count game_edr_${factor}_enhance)" ] || { echo "EDR factor $factor 数组长度不一致" >&2; return 1; }
+  done
+
+  for key in global_exceptions uir_apps foss2_apps foss4_apps method2_apps method3_apps method4_apps method6_apps method8_apps window_apps adfr_apps dbi_apps; do
+    [ -n "$(cfg_raw "$key")" ] && validate_packages "$key" || return 1
+  done
+
+  if [ "$unsafe" = false ]; then
+    for key in force_temperature_limit uir_temperature_limit; do
+      now=$(cfg_scalar "$key"); old=$(cfg_original "$key")
+      if awk -v a="$now" -v b="$old" 'BEGIN{exit !(a>b)}'; then echo "$key 放宽温控需要危险模式" >&2; return 1; fi
+    done
+    validate_voltage_protection || { echo "提高低电量/低温亮度上限需要危险模式" >&2; return 1; }
+    validate_array_not_raise dolby_temperature_nits || { echo "提高 Dolby 温控亮度档位需要危险模式" >&2; return 1; }
+    for key in demura_global_status demura_global_gain demura_aoi eyeprotect_profiles dbvgain_entries \
+      hbm_lux hbm_cct hbm_lux_table_mode mapping_edit_mode mapping_shared_dbv_propagation \
+      mapping_nit_multiplier mapping_dbv_multiplier mapping_overrides; do
+      [ -z "$(cfg_raw "$key")" ] && continue
+      [ "$(cfg_raw "$key")" = "$(cfg_original "$key")" ] || { echo "$key 属于硬件标定，修改需要危险模式" >&2; return 1; }
+    done
+  fi
+
+  # DBV hard limits are never removable.
+  cfg_raw dbvgain_entries | json_array_strings | awk -F'|' '
+    NF<6{exit 1} $3+0<0 || $3+0>4095{exit 2}
+    {for(i=4;i<=6;i++){n=split($i,a,",");if(n!=28)exit 3;for(j=1;j<=n;j++)if(a[j]+0<0||a[j]+0>255)exit 4}}
+  ' || { echo "DBV/Gamma 条目格式错误、DBV 超过 4095 或 Gamma 不是 28 项 0..255" >&2; return 1; }
+  nit_factor=$(cfg_scalar mapping_nit_multiplier)
+  dbv_factor=$(cfg_scalar mapping_dbv_multiplier)
+  configured_relationship=$(cfg_scalar mapping_relationship)
+  state_relationship=$(awk -F'|' 'NR==1{print $1;exit}' "$STATE/mapping_relationship" 2>/dev/null)
+  case "$state_relationship" in linked_equal|separate_nit) ;; *) echo "安装期 mapping_relationship 状态无效: ${state_relationship:-empty}" >&2; return 1;; esac
+  # The immutable installer state is authoritative. The JSON copy exists for
+  # WebUI display and backup readability; never let a parser/import/manual edit
+  # change how the hardware relationship is enforced.
+  relationship=$state_relationship
+  if [ "$configured_relationship" != "$state_relationship" ]; then
+    log "mapping relationship JSON differs; using installer state config=${configured_relationship:-empty} state=$state_relationship"
+  fi
+  mapping_mode=$(cfg_scalar mapping_edit_mode)
+  case "$mapping_mode" in linked|separate) ;; *) echo "mapping_edit_mode 只能是 linked 或 separate" >&2; return 1;; esac
+  if [ "$relationship" != linked_equal ] && [ "$mapping_mode" = linked ]; then
+    echo "原厂 Brightness/Apollo nit 不相等，不能使用 linked 编辑模式" >&2; return 1
+  fi
+  shared_propagation=$(cfg_scalar mapping_shared_dbv_propagation)
+  case "$shared_propagation" in true|false) ;; *) echo "mapping_shared_dbv_propagation 必须为 true 或 false" >&2; return 1;; esac
+  printf '%s\n%s\n' "$nit_factor" "$dbv_factor" | awk '$0!~/^[0-9]+([.][0-9]+)?$/||$0+0<0.01||$0+0>10{exit 1}' || {
+    echo "映射倍率必须是 0.01..10 的数字" >&2; return 1;
+  }
+  original_dbv_max=$(cfg_scalar panel_mapping_max_dbv)
+  awk -v m="$original_dbv_max" -v f="$dbv_factor" 'BEGIN{exit !(m*f>4095)}' && {
+    echo "Apollo DBV 统一倍率会使结果超过 4095" >&2; return 1;
+  }
+  cfg_raw mapping_overrides | json_array_strings | awk -F'|' '(NF!=3&&NF!=4){exit 1} $1!~/^[0-9]+$/||$2!~/^[0-9]+$/{exit 2} $3!~/^[0-9]+([.][0-9]+)?$/||(NF==4&&$4!~/^[0-9]+([.][0-9]+)?$/){exit 3} $2+0>4095{exit 4}' || { echo "映射覆盖格式必须为 level|整数DBV|brightness_nit|apollo_nit（兼容三列旧格式），且 DBV≤4095、nit≥0" >&2; return 1; }
+  mapcheck="$STATE/.mapping.check.$$"; cfg_raw mapping_overrides | json_array_strings > "$mapcheck"
+  BFILE=$(cfg_scalar brightness_file); AFILE=$(cfg_scalar apollo_file)
+  while IFS='|' read -r level dbv brightness_nit apollo_nit; do
+    [ -n "$level" ] || continue
+    [ -n "$apollo_nit" ] || apollo_nit=$brightness_nit
+    if [ "$mapping_mode" = linked ] && awk -v a="$brightness_nit" -v b="$apollo_nit" 'BEGIN{d=a-b;if(d<0)d=-d;exit !(d>0.0005)}'; then
+      rm -f "$mapcheck"; echo "linked 模式下 Level $level 的 brightness nit 与 Apollo nit 必须相等" >&2; return 1
+    fi
+    awk -F',' -v wanted="$level" '/<level>/{s=$1;sub(/^.*<level>/,"",s);gsub(/[[:space:]]/,"",s);if(s+0==wanted){ok=1;exit}}END{exit !ok}' "$ORIGINAL/$BFILE" || { rm -f "$mapcheck"; echo "映射覆盖等级 $level 不存在于原厂亮度表" >&2; return 1; }
+    awk -F',' -v wanted="$level" '/<Level>/{s=$1;sub(/^.*<Level>/,"",s);gsub(/[[:space:]]/,"",s);if(s+0==wanted){ok=1;exit}}END{exit !ok}' "$ORIGINAL/$AFILE" || { rm -f "$mapcheck"; echo "映射覆盖等级 $level 不存在于原厂 Apollo 表" >&2; return 1; }
+  done < "$mapcheck"
+  dup=$(cut -d'|' -f1 "$mapcheck" | sort | uniq -d | head -n 1)
+  [ -z "$dup" ] || { rm -f "$mapcheck"; echo "映射覆盖等级重复: $dup" >&2; return 1; }
+  if [ "$shared_propagation" = true ]; then
+    awk -F'|' '
+      NR==FNR {target[$1]=$2+0;next}
+      /<Level>/ {
+        s=$0;sub(/^.*<Level>/,"",s);sub(/<\/Level>.*$/,"",s);n=split(s,a,",")
+        id=a[1];dbv=a[2];gsub(/[[:space:]]/,"",id);gsub(/[[:space:]]/,"",dbv)
+        if(id in target){if((dbv in group_target)&&group_target[dbv]!=target[id])exit 1;group_target[dbv]=target[id]}
+      }
+    ' "$mapcheck" "$ORIGINAL/$AFILE" || { rm -f "$mapcheck"; echo "同一原厂 DBV 分组存在互相冲突的覆盖值" >&2; return 1; }
+  fi
+  rm -f "$mapcheck"
+  cfg_raw demura_aoi | json_array_strings | awk -F'=' 'NF!=2{exit 1} $2+0<0||$2+0>4095{exit 2}' || { echo "Demura AOI 必须为 nit=DBV 且 DBV≤4095" >&2; return 1; }
+
+  cfg_raw eyeprotect_profiles | json_array_strings | awk -F'|' '
+    NF<6{exit 1}
+    {n=split($3,t,",");if(!n)exit 1;for(i=4;i<=6;i++)if(split($i,a,",")!=n)exit 2}
+  ' || { echo "EyeProtect 色温与 RGB 数组长度不一致" >&2; return 1; }
+  return 0
+}
+
+replace_block() {
+  file=$1 start=$2 end=$3 block=$4
+  out="$file.tmp.$$"
+  awk -v start="$start" -v end="$end" -v block="$block" '
+    !skip && $0 ~ start {
+      while ((getline line < block)>0) print line
+      close(block); skip=1; if($0~end)skip=0; next
+    }
+    skip { if($0~end)skip=0; next }
+    {print}
+  ' "$file" > "$out" || return 1
+  mv -f "$out" "$file"
+}
+
+replace_tag() {
+  file=$1 tag=$2 value=$3
+  out="$file.tmp.$$"
+  awk -v tag="$tag" -v value="$value" '
+    !done && index($0,"<" tag ">") {
+      indent=$0; sub(/[^[:space:]].*$/,"",indent); print indent "<" tag ">" value "</" tag ">"; done=1; next
+    }
+    {print}
+    END{if(!done)exit 9}
+  ' "$file" > "$out" || { rm -f "$out"; return 1; }
+  mv -f "$out" "$file"
+}
+
+replace_attr() {
+  file=$1 tag=$2 attr=$3 value=$4
+  out="$file.tmp.$$"
+  awk -v tag="$tag" -v attr="$attr" -v value="$value" '
+    !done && index($0,"<" tag) {
+      p=index($0,attr "=\""); if(p){pre=substr($0,1,p-1);rest=substr($0,p+length(attr)+2);sub(/^[^\"]*\"/,"",rest);$0=pre attr "=\"" value "\"" rest;done=1}
+    }
+    {print}
+    END{if(!done)exit 9}
+  ' "$file" > "$out" || { rm -f "$out"; return 1; }
+  mv -f "$out" "$file"
+}
+
+replace_tag_sequence() {
+  file=$1 regex=$2 csv=$3
+  out="$file.tmp.$$"
+  awk -v regex="$regex" -v csv="$csv" '
+    BEGIN{n=split(csv,a,",")}
+    $0~regex {
+      idx++; if(idx>n)exit 8
+      s=$0; match(s,/<[^\/][^>]*>/); open=substr(s,RSTART,RLENGTH); name=open;sub(/^</,"",name);sub(/[ >].*$/,"",name)
+      indent=s;sub(/[^[:space:]].*$/,"",indent);print indent open a[idx] "</" name ">";next
+    }
+    {print}
+    END{if(idx!=n)exit 9}
+  ' "$file" > "$out" || { rm -f "$out"; return 1; }
+  mv -f "$out" "$file"
+}
+
+write_apps() {
+  key=$1 indent=$2
+  cfg_raw "$key" | json_array_strings | while IFS= read -r pkg; do
+    [ -n "$pkg" ] && printf '%s<app>%s</app>\n' "$indent" "$pkg"
+  done
+}
+
+build_method_block() {
+  id=$1 block=$2
+  {
+    printf '    <method id="%s">\n' "$id"
+    write_apps "method${id}_apps" '        '
+    printf '        <switch>%s</switch>\n' "$(cfg_scalar "method${id}_switch")"
+    for mode in 0 1; do
+      printf '        <nit mode="%s">%s</nit>\n' "$mode" "$(raw_csv "method${id}_nit${mode}")"
+      printf '        <ratio mode="%s">%s</ratio>\n' "$mode" "$(raw_csv "method${id}_ratio${mode}")"
+      printf '        <rate_in mode="%s">%s</rate_in>\n' "$mode" "$(raw_csv "method${id}_rate_in${mode}")"
+      printf '        <rate_out mode="%s">%s</rate_out>\n' "$mode" "$(raw_csv "method${id}_rate_out${mode}")"
+    done
+    echo '    </method>'
+  } > "$block"
+}
+
+patch_app_file() {
+  file=$1 work="$STATE/.blocks.$$"; mkdir -p "$work" || return 1
+
+  if is_changed foss_enable || is_changed foss2_apps || is_changed foss2_switch || is_changed foss2_ratio || \
+     is_changed foss4_apps || is_changed foss4_switch || is_changed foss4_ratio; then
+    block="$work/foss"
+    {
+      printf '    <foss enable="%s">\n' "$(cfg_scalar foss_enable)"
+      for id in 2 4; do
+        name='normal app'; [ "$id" = 4 ] && name=special
+        printf '        <type id="%s" name="%s">\n' "$id" "$name"
+        write_apps "foss${id}_apps" '            '
+        printf '            <switch>%s</switch>\n' "$(cfg_scalar "foss${id}_switch")"
+        printf '            <ratio>%s</ratio>\n' "$(cfg_scalar "foss${id}_ratio")"
+        echo '        </type>'
+      done
+      echo '    </foss>'
+    } > "$block"
+    replace_block "$file" '^[[:space:]]*<foss ' '^[[:space:]]*</foss>' "$block" || return 1
+  fi
+
+  for id in 2 3 4 6 8; do
+    any=0
+    for key in apps switch nit0 ratio0 rate_in0 rate_out0 nit1 ratio1 rate_in1 rate_out1; do is_changed "method${id}_$key" && any=1; done
+    if [ "$any" -eq 1 ]; then
+      block="$work/method$id"; build_method_block "$id" "$block"
+      replace_block "$file" "^[[:space:]]*<method id=\"$id\">" '^[[:space:]]*</method>' "$block" || return 1
+    fi
+  done
+
+  if is_changed global_limit || is_changed global_exceptions; then
+    block="$work/global"
+    { printf '    <global_brightness_limit nit="%s">\n' "$(cfg_scalar global_limit)"; write_apps global_exceptions '        '; echo '    </global_brightness_limit>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<global_brightness_limit ' '^[[:space:]]*</global_brightness_limit>' "$block" || return 1
+  fi
+
+  if is_changed dolby_temperature_nits; then
+    block="$work/dolby"
+    { echo '    <dolby_temperature_limit_nit>'; cfg_numbers dolby_temperature_nits | while IFS= read -r v; do printf '        <nits>%s</nits>\n' "$v"; done; echo '    </dolby_temperature_limit_nit>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<dolby_temperature_limit_nit>' '^[[:space:]]*</dolby_temperature_limit_nit>' "$block" || return 1
+  fi
+
+  if is_changed game_brightness_nit || is_changed game_brightness_ratio || is_changed game_brightness_rate; then
+    block="$work/game_brightness"
+    { echo '    <game_brightness>'; printf '        <nit>%s</nit>\n' "$(raw_csv game_brightness_nit)"; printf '        <ratio>%s</ratio>\n' "$(raw_csv game_brightness_ratio)"; printf '        <rate>%s</rate>\n' "$(raw_csv game_brightness_rate)"; echo '    </game_brightness>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<game_brightness>' '^[[:space:]]*</game_brightness>' "$block" || return 1
+  fi
+
+  edr=0; for f in 25 27; do is_changed "game_edr_${f}_origin" && edr=1; is_changed "game_edr_${f}_enhance" && edr=1; done
+  if [ "$edr" -eq 1 ]; then
+    block="$work/game_edr"
+    {
+      echo '    <game_edr>'
+      for f in 25 27; do
+        printf "        <origin_nit factor='%s'>%s</origin_nit>\n" "$f" "$(raw_csv "game_edr_${f}_origin")"
+        printf "        <enhance_nit factor='%s'>%s</enhance_nit>\n" "$f" "$(raw_csv "game_edr_${f}_enhance")"
+      done
+      echo '    </game_edr>'
+    } > "$block"
+    replace_block "$file" '^[[:space:]]*<game_edr>' '^[[:space:]]*</game_edr>' "$block" || return 1
+  fi
+
+  if is_changed window_limit || is_changed window_apps; then
+    block="$work/window"
+    { echo '    <window_brightness>'; printf '        <limitnit>%s</limitnit>\n' "$(cfg_scalar window_limit)"; write_apps window_apps '        '; echo '    </window_brightness>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<window_brightness>' '^[[:space:]]*</window_brightness>' "$block" || return 1
+  fi
+
+  if is_changed dark_env_support || is_changed dark_env_lux || is_changed dark_env_scale; then
+    block="$work/dark"
+    { echo '    <DarkEnvReduceBrightness>'; printf '        <support>%s</support>\n' "$(cfg_scalar dark_env_support)"; printf '        <lux>%s</lux>\n' "$(raw_csv dark_env_lux)"; printf '        <scale>%s</scale>\n' "$(raw_csv dark_env_scale)"; echo '    </DarkEnvReduceBrightness>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<DarkEnvReduceBrightness>' '^[[:space:]]*</DarkEnvReduceBrightness>' "$block" || return 1
+  fi
+
+  for tag in force_temperature_limit light_sensor_always_on_support BrightnessHalfVsync DualRampAnimatorOpt dual_light_sensor_fusion_support dark_env_brightness_smooth_optimize_support; do
+    is_changed "$tag" && replace_tag "$file" "$tag" "$(cfg_scalar "$tag")" || true
+  done
+  if is_changed comfortable_motion_support; then replace_tag "$file" MotionModeSupport "$(cfg_scalar comfortable_motion_support)" || return 1; fi
+  if is_changed comfortable_thresholds; then replace_tag_sequence "$file" 'MotionMode(InTransportation|OnFoot)LuxThreshold>' "$(raw_csv comfortable_thresholds)" || return 1; fi
+  for pair in 'backlight_luxs:luxs' 'backlight_app_levels:appLevels' 'backlight_dur_levels:durLevels' 'backlight_max_lux:maxLux'; do
+    key=${pair%%:*}; tag=${pair#*:}; is_changed "$key" && replace_tag "$file" "$tag" "$(raw_csv "$key")" || true
+  done
+  rm -rf "$work"
+}
+
+patch_auto_file() {
+  file=$1
+  is_changed auto_curve || return 0
+  block="$STATE/.auto.$$"
+  {
+    echo '    <lux_table name="expressiveness">'
+    cfg_raw auto_curve | awk '{s=$0;gsub(/\[/,"",s);gsub(/\]/,"",s);gsub(/[[:space:]]/,"",s);n=split(s,a,",");for(i=1;i<=n;i+=2)printf "        <lux>%s,%s</lux>\n",a[i],a[i+1]}'
+    echo '    </lux_table>'
+  } > "$block"
+  replace_block "$file" '^[[:space:]]*<lux_table name="expressiveness">' '^[[:space:]]*</lux_table>' "$block"
+  rc=$?; rm -f "$block"; return $rc
+}
+
+patch_uir_file() {
+  file=$1; any=0
+  for key in uir_enable uir_brightness_limit uir_temperature_limit uir_max_ratio uir_apps; do is_changed "$key" && any=1; done
+  [ "$any" -eq 1 ] || return 0
+  block="$STATE/.uir.$$"
+  {
+    echo '    <uir_config>'
+    printf '        <uir_enable>%s</uir_enable>\n' "$(cfg_scalar uir_enable)"
+    printf '        <brightness_nit_limit>%s</brightness_nit_limit>\n' "$(cfg_scalar uir_brightness_limit)"
+    printf '        <temperature_limit>%s</temperature_limit>\n' "$(cfg_scalar uir_temperature_limit)"
+    printf '        <max_ratio>%s</max_ratio>\n' "$(cfg_scalar uir_max_ratio)"
+    echo '        <app_list>'
+    write_apps uir_apps '            '
+    echo '        </app_list>'
+    echo '    </uir_config>'
+  } > "$block"
+  replace_block "$file" '^[[:space:]]*<uir_config>' '^[[:space:]]*</uir_config>' "$block"
+  rc=$?; rm -f "$block"; return $rc
+}
+
+patch_voltage_file() {
+  file=$1
+  is_changed voltage_matrix || return 0
+  version=$(xml_value "$file" version)
+  rows="$STATE/.voltage.rows.$$"; cfg_raw voltage_matrix | json_array_strings > "$rows"
+  out="$file.tmp.$$"
+  {
+    echo '<?xml version="1.0" encoding="UTF-8"?>'
+    echo '<root>'
+    printf '    <version>%s</version>\n' "$version"
+    while IFS= read -r row; do
+      temp=$(printf '%s\n' "$row" | awk -F'|' 'NR==1{print $1;exit}')
+      printf '    <lowvoltage_brightness_limit support="1" name="%s" temperatureRange="%s">\n' "$(cfg_scalar voltage_profile_name)" "$temp"
+      printf '%s\n' "$row" | awk -F'|' '
+        {for(i=2;i<=NF;i++){p=index($i,"=");if(!p)exit 8;bat=substr($i,1,p-1);vals=substr($i,p+1);printf "        <limitnit batteryRange=\"%s\">%s</limitnit>\n",bat,vals}}
+      ' || { rm -f "$out" "$rows"; return 1; }
+      echo '    </lowvoltage_brightness_limit>'
+    done < "$rows"
+    echo '</root>'
+  } > "$out" || { rm -f "$out" "$rows"; return 1; }
+  mv -f "$out" "$file"; rc=$?; rm -f "$rows"; return $rc
+}
+
+patch_adfr_file() {
+  file=$1; [ -f "$file" ] || return 0
+  for tag in panelnit_enable sensor_inlux sensor_outlux panelnit_level aod_panelnit_level; do
+    key="adfr_$tag"
+    if is_changed "$key"; then replace_tag "$file" "$tag" "$(cfg_scalar "$key")" || return 1; fi
+  done
+  if is_changed adfr_apps; then
+    block="$STATE/.adfr_apps.$$"
+    { echo '        <app_list>'; echo '           <type id="1" name="game">'; write_apps adfr_apps '                  '; echo '           </type>'; echo '        </app_list>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<app_list>' '^[[:space:]]*</app_list>' "$block" || { rm -f "$block"; return 1; }
+    rm -f "$block"
+  fi
+}
+
+patch_dbi_file() {
+  file=$1; [ -f "$file" ] || return 0
+  is_changed dbi_enable && replace_tag "$file" dbi_enable "$(cfg_scalar dbi_enable)" || true
+  is_changed dbi_capture_interval && replace_tag "$file" capture_interval "$(cfg_scalar dbi_capture_interval)" || true
+  if is_changed dbi_app_list_enable || is_changed dbi_apps; then
+    block="$STATE/.dbi_apps.$$"
+    { printf '    <app_list enable="%s">\n' "$(cfg_scalar dbi_app_list_enable)"; write_apps dbi_apps '        '; echo '    </app_list>'; } > "$block"
+    replace_block "$file" '^[[:space:]]*<app_list ' '^[[:space:]]*</app_list>' "$block" || { rm -f "$block"; return 1; }
+    rm -f "$block"
+  fi
+}
+
+patch_demura_files() {
+  mfile="$1/multimedia_display_demura_config.xml"
+  if [ -f "$mfile" ]; then
+    is_changed demura_global_status && replace_tag "$mfile" DemuraGlobalStatus "$(cfg_scalar demura_global_status)" || true
+    is_changed demura_global_gain && replace_tag "$mfile" DemuraGlobalGain "$(cfg_scalar demura_global_gain)" || true
+  fi
+  is_changed demura_aoi || return 0
+  pfile=$(find "$1" -maxdepth 1 -name 'display_demura_config_panel_*.xml' | head -n 1)
+  [ -f "$pfile" ] || return 1
+  block="$STATE/.demura_aoi.$$"
+  {
+    echo '    <aoi>'
+    cfg_raw demura_aoi | json_array_strings | while IFS= read -r entry; do
+      nit=${entry%%=*}; dbv=${entry#*=}; printf '        <dbv nit="%s">%s</dbv>\n' "$nit" "$dbv"
+    done
+    echo '    </aoi>'
+  } > "$block"
+  replace_block "$pfile" '^[[:space:]]*<aoi>' '^[[:space:]]*</aoi>' "$block"
+  rc=$?; rm -f "$block"; return $rc
+}
+
+patch_eyeprotect_files() {
+  root=$1
+  is_changed eyeprotect_profiles || return 0
+  entries="$STATE/.eye.$$"; originals="$STATE/.eye.original.$$"
+  cfg_raw eyeprotect_profiles | json_array_strings > "$entries"
+  cfg_original eyeprotect_profiles | json_array_strings > "$originals"
+  while IFS= read -r entry; do
+    oldifs=$IFS; IFS='|'; set -- $entry; IFS=$oldifs
+    name=$1; def=$2; temp=$3; red=$4; green=$5; blue=$6
+    case "$name" in ''|*/*|*..*) rm -f "$entries" "$originals"; return 1;; esac
+    if awk -F'|' -v name="$name" -v entry="$entry" '$1==name && $0==entry{same=1}END{exit !same}' "$originals"; then continue; fi
+    file="$root/EyeProtect/$name"; [ -f "$file" ] || { rm -f "$entries" "$originals"; return 1; }
+    out="$file.tmp.$$"
+    {
+      echo "<?xml version='1.0' encoding='utf-8' standalone='yes' ?>"
+      echo '<Data>'
+      printf '<Color_Temp>\n%s\n</Color_Temp>\n' "$temp"
+      printf '<Red>\n%s\n</Red>\n' "$red"
+      printf '<Green>\n%s\n</Green>\n' "$green"
+      printf '<Blue>\n%s\n</Blue>\n' "$blue"
+      printf '<Default>\n    %s\n</Default>\n' "$def"
+      echo '</Data>'
+    } > "$out" || { rm -f "$out" "$entries" "$originals"; return 1; }
+    mv -f "$out" "$file" || { rm -f "$entries" "$originals"; return 1; }
+  done < "$entries"
+  rm -f "$entries" "$originals"
+}
+
+patch_dbvgain_file() {
+  root=$1
+  is_changed dbvgain_entries || return 0
+  file=$(find "$root" -maxdepth 1 -name 'display_dbvgain_config_panel_*.xml' | head -n 1)
+  [ -f "$file" ] || return 1
+  entries="$STATE/.dbv.$$"; cfg_raw dbvgain_entries | json_array_strings > "$entries"
+  out="$file.tmp.$$"
+  awk -v entries="$entries" '
+    BEGIN {
+      FS="|"; while((getline line < entries)>0){split(line,a,"|");k=a[1] "|" a[2];dbv[k]=a[3];r[k]=a[4];g[k]=a[5];b[k]=a[6]} close(entries)
+    }
+    function attr(line,name, s,p){p=index(line,name "=\"");if(!p)return "";s=substr(line,p+length(name)+2);sub(/\".*$/,"",s);return s}
+    /<dbv_gain_fps / {fps=attr($0,"fps")}
+    /<dbv_gain id=/ {
+      id=attr($0,"id");k=fps "|" id;if(!(k in dbv))exit 8
+      p=index($0,"dbv=\"");pre=substr($0,1,p-1);rest=substr($0,p+5);sub(/^[^\"]*\"/,"",rest);$0=pre "dbv=\"" dbv[k] "\"" rest;active=k
+    }
+    active!="" && /<gamma_mapping sub="r"/ {sub(/>[^<]*</,">" r[active] "<")}
+    active!="" && /<gamma_mapping sub="g"/ {sub(/>[^<]*</,">" g[active] "<")}
+    active!="" && /<gamma_mapping sub="b"/ {sub(/>[^<]*</,">" b[active] "<")}
+    active!="" && /<\/dbv_gain>/ {active=""}
+    {print}
+  ' "$file" > "$out" || { rm -f "$out" "$entries"; return 1; }
+  mv -f "$out" "$file"; rc=$?; rm -f "$entries"; return $rc
+}
+
+patch_mapping_files() {
+  root=$1
+  changed=0
+  for key in mapping_edit_mode mapping_shared_dbv_propagation mapping_nit_multiplier mapping_dbv_multiplier mapping_overrides; do
+    is_changed "$key" && changed=1
+  done
+  [ "$changed" -eq 1 ] || return 0
+  BFILE=$(cfg_scalar brightness_file); AFILE=$(cfg_scalar apollo_file)
+  nit_factor=$(cfg_scalar mapping_nit_multiplier)
+  dbv_factor=$(cfg_scalar mapping_dbv_multiplier)
+  entries="$STATE/.mapping.$$"; cfg_raw mapping_overrides | json_array_strings > "$entries"
+  dbv_entries="$STATE/.mapping.dbv.$$"
+  propagate=$(cfg_scalar mapping_shared_dbv_propagation)
+  awk -F'|' -v propagate="$propagate" '
+    NR==FNR {explicit[$1]=$2+0;next}
+    /<Level>/ {
+      s=$0;sub(/^.*<Level>/,"",s);sub(/<\/Level>.*$/,"",s);n=split(s,a,",")
+      id=a[1];dbv=a[2];gsub(/[[:space:]]/,"",id);gsub(/[[:space:]]/,"",dbv)
+      order[++rows]=id;original_dbv[id]=dbv+0
+      if(id in explicit)group_target[dbv+0]=explicit[id]
+    }
+    END {
+      for(i=1;i<=rows;i++){
+        id=order[i]
+        if(id in explicit)print id "|" explicit[id]
+        else if(propagate=="true" && (original_dbv[id] in group_target))print id "|" group_target[original_dbv[id]]
+      }
+    }
+  ' "$entries" "$ORIGINAL/$AFILE" > "$dbv_entries" || { rm -f "$entries" "$dbv_entries"; return 1; }
+  b="$root/$BFILE"; a="$root/$AFILE"; bout="$b.tmp.$$"; aout="$a.tmp.$$"
+  awk -v entries="$entries" -v factor="$nit_factor" -F',' '
+    BEGIN{while((getline line<entries)>0){split(line,x,"|");nit[x[1]]=x[3]}close(entries)}
+    /<level>/ {
+      id=$1;sub(/^.*<level>/,"",id);gsub(/[[:space:]]/,"",id)
+      original=$3;gsub(/[[:space:]]/,"",original)
+      target=(id in nit)?nit[id]:original*factor
+      $3=sprintf("%.3f",target)
+      line=$1;for(i=2;i<=NF;i++)line=line "," $i;$0=line
+    }
+    {print}
+  ' OFS=',' "$b" > "$bout" || { rm -f "$entries" "$dbv_entries" "$bout"; return 1; }
+  awk -v entries="$entries" -v dbv_entries="$dbv_entries" -v nit_factor="$nit_factor" -v dbv_factor="$dbv_factor" -F',' '
+    BEGIN{
+      while((getline line<entries)>0){n=split(line,x,"|");nit[x[1]]=(n>=4?x[4]:x[3])}close(entries)
+      while((getline line<dbv_entries)>0){split(line,x,"|");dbv[x[1]]=x[2]}close(dbv_entries)
+    }
+    /<Level>/ {
+      id=$1;sub(/^.*<Level>/,"",id);gsub(/[[:space:]]/,"",id)
+      original_dbv=$2;gsub(/[[:space:]]/,"",original_dbv)
+      original_nit=$NF;sub(/<\/Level>.*/,"",original_nit);gsub(/[[:space:]]/,"",original_nit)
+      target_dbv=(id in dbv)?dbv[id]:sprintf("%.0f",original_dbv*dbv_factor)
+      target_nit=(id in nit)?nit[id]:sprintf("%.3f",original_nit*nit_factor)
+      $2=target_dbv;$3=target_dbv;$NF=target_nit "</Level>"
+      line=$1;for(i=2;i<=NF;i++)line=line "," $i;$0=line
+    }
+    {print}
+  ' OFS=',' "$a" > "$aout" || { rm -f "$entries" "$dbv_entries" "$bout" "$aout"; return 1; }
+  mv -f "$bout" "$b" && mv -f "$aout" "$a"; rc=$?; rm -f "$entries" "$dbv_entries"; return $rc
+}
+
+patch_tree() {
+  root=$1
+  BFILE=$(cfg_scalar brightness_file); SFILE=$(cfg_scalar sensor_file)
+  if is_changed manual_max_level; then replace_attr "$root/$BFILE" brightness_table max "$(cfg_scalar manual_max_level)" || return 1; fi
+  if is_changed hbm_lux_table_mode; then replace_tag "$root/$BFILE" hbm_lux_table_mode "$(cfg_scalar hbm_lux_table_mode)" || return 1; fi
+  if is_changed hbm_lux; then replace_tag "$root/$SFILE" Hbm_Lux "$(cfg_scalar hbm_lux)" || return 1; fi
+  if is_changed hbm_cct; then replace_tag "$root/$SFILE" Hbm_Cct "$(cfg_scalar hbm_cct)" || return 1; fi
+  patch_auto_file "$root/multimedia_display_brightness_config.xml" || return 1
+  patch_app_file "$root/display_brightness_app_list.xml" || return 1
+  patch_uir_file "$root/multimedia_display_uir_config.xml" || return 1
+  patch_voltage_file "$root/multimedia_display_voltage_limit.xml" || return 1
+  patch_adfr_file "$root/multimedia_display_adfr2minfps_config.xml" || return 1
+  patch_dbi_file "$root/multimedia_display_dbi_config.xml" || return 1
+  patch_demura_files "$root" || return 1
+  patch_eyeprotect_files "$root" || return 1
+  patch_dbvgain_file "$root" || return 1
+  patch_mapping_files "$root" || return 1
+}
+
+validate_generated() {
+  root=$1
+  list="$STATE/.xml.validate.$$"
+  validation_error=
+  find "$root" -type f -name '*.xml' -print | sort > "$list" || return 1
+  while IFS= read -r f; do
+    [ -s "$f" ] || { validation_error="E_XML_EMPTY: $f"; break; }
+
+    # Vendor XML roots are not limited to root/filter-conf/Data. Determine the
+    # first real element from the whole document while skipping declarations,
+    # comments and DOCTYPE blocks. Reading the whole document also handles
+    # minified XML whose declaration and root are on the same line.
+    root_name=$(awk '
+      { data=data $0 "\n" }
+      END {
+        bom=sprintf("%c%c%c",239,187,191)
+        if (substr(data,1,3)==bom) data=substr(data,4)
+        while (length(data)) {
+          sub(/^[[:space:]]*/,"",data)
+          if (substr(data,1,4)=="<!--") {
+            p=index(data,"-->"); if (!p) exit 1
+            data=substr(data,p+3); continue
+          }
+          if (substr(data,1,2)=="<?") {
+            p=index(data,"?>"); if (!p) exit 1
+            data=substr(data,p+2); continue
+          }
+          if (substr(data,1,2)=="<!") {
+            p=index(data,">"); if (!p) exit 1
+            data=substr(data,p+1); continue
+          }
+          if (substr(data,1,1)!="<") exit 1
+          s=substr(data,2)
+          if (s !~ /^[A-Za-z_]/) exit 1
+          sub(/[[:space:]>].*$/,"",s); sub(/\/$/,"",s)
+          if (s !~ /^[A-Za-z_][A-Za-z0-9_.:-]*$/) exit 1
+          print s; exit
+        }
+      }
+    ' "$f")
+    [ -n "$root_name" ] || { validation_error="E_XML_ROOT_MISSING: $f"; break; }
+    grep -Fq "</$root_name>" "$f" || { validation_error="E_XML_ROOT_UNCLOSED: $root_name in $f"; break; }
+
+    # Reject the exact malformed legacy line ending in a lone '<'. Compact,
+    # valid XML such as <method id="6"><switch>...</switch> is not rejected.
+    grep -Eq '^[[:space:]]*<method[[:space:]]+id="6">[[:space:]]*<[[:space:]]*$' "$f" && {
+      validation_error="E_XML_LEGACY_METHOD6: $f"; break;
+    }
+  done < "$list"
+  rm -f "$list"
+  [ -z "$validation_error" ] || { echo "$validation_error" >&2; return 1; }
+  dbv=$(find "$root" -maxdepth 1 -name 'display_dbvgain_config_panel_*.xml' | head -n 1)
+  if [ -f "$dbv" ]; then
+    awk '
+      /<dbv_gain id=/ {s=$0;sub(/^.*dbv="/,"",s);sub(/".*$/,"",s);if(s+0>4095)exit 1}
+      /<dbv_bind_bin_dbv>/ {s=$0;gsub(/<[^>]+>/,"",s);gsub(/[[:space:]]/,"",s);n=split(s,a,",");for(i=1;i<=n;i++)if(a[i]+0>4095)exit 1}
+    ' "$dbv" || { echo "E_DBV_RANGE: DBV exceeds 4095 in $dbv" >&2; return 1; }
+  fi
+  AFILE=$(cfg_scalar apollo_file)
+  awk -F',' '/<Level>/{id=$1;sub(/^.*<Level>/,"",id);gsub(/[[:space:]]/,"",id);if(seen[id]++)exit 1}' "$root/$AFILE" || { echo "E_APOLLO_DUPLICATE_LEVEL: $root/$AFILE" >&2; return 1; }
+  BFILE=$(cfg_scalar brightness_file)
+  mapping_mode=$(cfg_scalar mapping_edit_mode)
+  awk -F',' -v mode="$mapping_mode" '
+    function trim(s){gsub(/^[[:space:]]+|[[:space:]]+$/,"",s);return s}
+    function abs(v){return v<0?-v:v}
+    NR==FNR && /<level>/ {
+      s=$0;sub(/^.*<level>/,"",s);sub(/<\/level>.*$/,"",s);n=split(s,a,",")
+      id=trim(a[1]);idx=trim(a[2]);nit=trim(a[3])+0
+      if(rows&&id+0<=previous_id)exit 11
+      if(rows&&nit+0<previous_nit-0.0005)exit 12
+      if(id+0!=idx+0)exit 13
+      bnit[id]=nit;bseen[id]=1;rows++;previous_id=id+0;previous_nit=nit;next
+    }
+    NR!=FNR && /<Level>/ {
+      s=$0;sub(/^.*<Level>/,"",s);sub(/<\/Level>.*$/,"",s);n=split(s,a,",")
+      id=trim(a[1]);dbv1=trim(a[2])+0;dbv2=trim(a[3])+0;nit=trim(a[n])+0
+      if(!(id in bseen))exit 14
+      if(arows&&id+0<=previous_aid)exit 15
+      if(dbv1!=dbv2 || dbv1<0 || dbv1>4095)exit 16
+      if(arows&&dbv1<previous_dbv)exit 17
+      if(arows&&nit<previous_anit-0.0005)exit 18
+      if(mode=="linked"&&abs(bnit[id]-nit)>0.0005)exit 19
+      aseen[id]=1;arows++;previous_aid=id+0;previous_dbv=dbv1;previous_anit=nit;next
+    }
+    END{if(rows!=arows)exit 20;for(id in bseen)if(!(id in aseen))exit 21}
+  ' "$root/$BFILE" "$root/$AFILE" || { echo "E_MAPPING_COHERENCE: Level/DBV/nit 映射不递增、结构不同或 linked nit 不相等" >&2; return 1; }
+  return 0
+}
+
+build_manifest() {
+  local root out rel
+  root=$1 out=$2
+  : > "$out"
+  (cd "$root" && find . -type f -name '*.xml' -print | sort) | while IFS= read -r rel; do
+    rel=${rel#./}
+    cmp -s "$root/$rel" "$ORIGINAL/$rel" || printf '%s\n' "$rel" >> "$out"
+  done
+}
+
+unmount_manifest() {
+  local manifest rel
+  manifest=$1
+  [ -f "$manifest" ] || return 0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] && umount "$TARGET_ETC/$rel" 2>/dev/null
+  done < "$manifest"
+}
+
+mount_manifest() {
+  local root manifest rel src dst ctx
+  root=$1 manifest=$2
+  [ -f "$manifest" ] || return 0
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    src="$root/$rel"; dst="$TARGET_ETC/$rel"
+    [ -f "$src" ] && [ -f "$dst" ] || return 1
+    chmod 0644 "$src" 2>/dev/null
+    ctx=$(ls -Zd "$dst" 2>/dev/null | awk '{print $1}')
+    [ -n "$ctx" ] && chcon "$ctx" "$src" 2>/dev/null
+    mount -o bind "$src" "$dst" || return 1
+  done < "$manifest"
+}
+
+write_status() {
+  state_value=$1 changed=$2 message=$3 pending=$4
+  printf '{"state":"%s","changed_files":%s,"pending_reboot":%s,"message":"%s","config":"%s","original":"%s","generated":"%s","updated_at":"%s"}\n' \
+    "$state_value" "$changed" "$pending" "$(printf '%s' "$message" | json_escape)" "$CONFIG_PATH" "$ORIGINAL" "$GENERATED" "$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null)" > "$STATE/status.json"
+}
+
+rotate_backups() {
+  ls -1t "$BACKUPS"/config-*.json 2>/dev/null | awk 'NR>10' | while IFS= read -r f; do rm -f "$f"; done
+}
+
+backup_config() {
+  stamp=$(date '+%Y%m%d-%H%M%S' 2>/dev/null); [ -n "$stamp" ] || stamp=$(date +%s)
+  out="$BACKUPS/config-$stamp.json"; cp -af "$CONFIG" "$out" || return 1; rotate_backups; echo "$out"
+}
+
+apply_config() {
+  local __apply_mode stage previous manifest changed oldmanifest
+  __apply_mode=$1
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    lock_pid=$(cat "$LOCK/pid" 2>/dev/null)
+    if [ -n "$lock_pid" ] && kill -0 "$lock_pid" 2>/dev/null; then
+      echo "另一个应用任务正在运行 (PID $lock_pid)" >&2
+      return 20
+    fi
+    rm -rf "$LOCK" 2>/dev/null
+    mkdir "$LOCK" 2>/dev/null || { echo "无法恢复应用锁" >&2; return 20; }
+    log "removed stale apply lock pid=${lock_pid:-unknown}"
+  fi
+  printf '%s\n' "$$" > "$LOCK/pid"
+  trap 'rm -rf "$LOCK" 2>/dev/null' EXIT INT TERM
+  log "apply start mode=$__apply_mode"
+
+  normalize_auto_curve_config || { echo "自动亮度曲线排序失败" >&2; return 21; }
+
+  if ! validate_config >> "$LOGDIR/apply.log" 2>&1; then
+    write_status validation_failed 0 '配置校验失败，请查看日志' false
+    echo "配置校验失败，请查看 $LOGDIR/apply.log" >&2
+    return 21
+  fi
+
+  backup_config >> "$LOGDIR/apply.log" 2>&1 || { echo "备份配置失败" >&2; return 22; }
+  stage="$MODDIR/data/.generated.new.$$"; previous="$MODDIR/data/.generated.previous"
+  rm -rf "$stage"; mkdir -p "$stage" || return 22
+  cp -af "$ORIGINAL/." "$stage/" || { rm -rf "$stage"; return 22; }
+  patch_tree "$stage" >> "$LOGDIR/apply.log" 2>&1 || { rm -rf "$stage"; write_status build_failed 0 '生成 XML 失败' false; echo "生成 XML 失败" >&2; return 23; }
+  if ! validate_generated "$stage" >> "$LOGDIR/apply.log" 2>&1; then
+    tail -n 20 "$LOGDIR/apply.log" >&2 2>/dev/null
+    rm -rf "$stage"
+    write_status validation_failed 0 '生成 XML 校验失败' false
+    echo "E_GENERATED_XML_VALIDATE: $LOGDIR/apply.log" >&2
+    return 24
+  fi
+  manifest="$STATE/.mounts.new.$$"; build_manifest "$stage" "$manifest"
+  changed=$(awk 'END{print NR+0}' "$manifest")
+
+  if [ "$__apply_mode" = no-mount ]; then
+    rm -rf "$GENERATED"; mv "$stage" "$GENERATED" || return 25
+    mv -f "$manifest" "$STATE/mounts.list"
+    write_status generated "$changed" '配置已生成；尚未挂载' true
+    log "apply generated changed=$changed"
+    return 0
+  fi
+
+  oldmanifest="$STATE/mounts.list"
+  rm -rf "$previous"; [ -d "$GENERATED" ] && cp -af "$GENERATED" "$previous"
+  [ -f "$oldmanifest" ] && cp -af "$oldmanifest" "$STATE/.mounts.previous" || : > "$STATE/.mounts.previous"
+  unmount_manifest "$oldmanifest"
+  rm -rf "$GENERATED"; mv "$stage" "$GENERATED" || return 25
+  mv -f "$manifest" "$STATE/mounts.list"
+
+  if ! mount_manifest "$GENERATED" "$STATE/mounts.list"; then
+    log 'mount failed, rolling back'
+    unmount_manifest "$STATE/mounts.list"
+    rm -rf "$GENERATED"; [ -d "$previous" ] && mv "$previous" "$GENERATED"
+    mv -f "$STATE/.mounts.previous" "$STATE/mounts.list"
+    mount_manifest "$GENERATED" "$STATE/mounts.list" 2>/dev/null
+    write_status rolled_back 0 '挂载失败，已回滚' false
+    echo "挂载失败，已回滚" >&2
+    return 26
+  fi
+  rm -rf "$previous" "$STATE/.mounts.previous"
+  if [ "$__apply_mode" = boot ]; then
+    write_status applied "$changed" '已在启动阶段挂载配置' false
+  else
+    write_status pending_reboot "$changed" '文件已更新；请重启以可靠生效' true
+  fi
+  update_description >/dev/null 2>&1
+  log "apply success changed=$changed mode=$__apply_mode"
+  return 0
+}
+
+update_description() {
+  state_value=$(awk -F'"' '/"state"/{for(i=1;i<=NF;i++)if($i=="state"){print $(i+2);exit}}' "$STATE/status.json" 2>/dev/null)
+  changed=$(awk -F'[:,]' '/"changed_files"/{for(i=1;i<=NF;i++)if($i~"changed_files"){gsub(/[^0-9]/,"",$(i+1));print $(i+1);exit}}' "$STATE/status.json" 2>/dev/null)
+  [ -n "$state_value" ] || state_value=unknown; [ -n "$changed" ] || changed=0
+  desc="[$state_value | $changed files] JSON: $MODDIR/config/config.json | ETC: $MODDIR/data/original/etc"
+  out="$MODDIR/module.prop.tmp.$$"
+  awk -v desc="$desc" 'BEGIN{done=0}/^description=/{print "description=" desc;done=1;next}{print}END{if(!done)print "description=" desc}' "$MODDIR/module.prop" > "$out" && mv -f "$out" "$MODDIR/module.prop"
+  if [ -x /data/adb/ksu/bin/ksud ]; then KSU_MODULE=oplus_brightness_control /data/adb/ksu/bin/ksud module config set override.description "$desc" >/dev/null 2>&1; fi
+}
+
+verify_mounts() {
+  missing=0; total=0
+  [ -f "$STATE/mounts.list" ] || { update_description; return 0; }
+  while IFS= read -r rel; do
+    [ -n "$rel" ] || continue; total=$((total+1))
+    awk -v p="$TARGET_ETC/$rel" '$5==p{ok=1}END{exit !ok}' /proc/self/mountinfo 2>/dev/null || missing=$((missing+1))
+  done < "$STATE/mounts.list"
+  if [ "$missing" -gt 0 ]; then write_status mount_incomplete "$total" "$missing 个文件未挂载；请重启或检查冲突模块" true; fi
+  update_description
+}
+
+import_config() {
+  src=$1; [ -f "$src" ] || { echo "导入文件不存在" >&2; return 1; }
+  old="$STATE/.config.old.$$"; cp -af "$CONFIG" "$old" || return 1
+  cp -af "$src" "$CONFIG" || { rm -f "$old"; return 1; }
+  if validate_config >> "$LOGDIR/apply.log" 2>&1; then rm -f "$old"; echo "配置导入成功"; return 0; fi
+  mv -f "$old" "$CONFIG"; echo "导入配置校验失败，已恢复原配置" >&2; return 1
+}
+
+apply_import() {
+  src=$1
+  [ -f "$src" ] || { echo "E_IMPORT_SOURCE_MISSING: $src" >&2; return 30; }
+  staged="$STATE/.config.webui-staged.$$"
+  cp -af "$src" "$staged" || { echo "E_IMPORT_STAGE_COPY" >&2; return 32; }
+  CONFIG="$staged"
+  apply_config normal
+  rc=$?
+  CONFIG="$CONFIG_PATH"
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$staged"
+    echo "E_IMPORT_APPLY_$rc: active JSON was never replaced; generated files/mounts were rolled back" >&2
+    tail -n 30 "$LOGDIR/apply.log" >&2 2>/dev/null
+    return "$rc"
+  fi
+  mv -f "$staged" "$CONFIG_PATH" || { echo "E_IMPORT_COMMIT: generated files applied but JSON commit failed" >&2; return 34; }
+  echo 'APPLY_IMPORT_OK: configuration validated, generated and applied'
+  return 0
+}
+
+valid_job_id() {
+  case "$1" in ''|*[!A-Za-z0-9_-]*) return 1;; *) return 0;; esac
+}
+
+run_job() {
+  job=$1
+  valid_job_id "$job" || { echo "E_JOB_ID" >&2; return 1; }
+  jobs="$STATE/jobs"; input="$jobs/$job.json"; output="$jobs/$job.log"; result="$jobs/$job.rc"; phase="$jobs/$job.state"
+  [ -f "$input" ] || { echo "E_JOB_SOURCE_MISSING: $input" >&2; return 1; }
+  printf '%s\n' RUNNING > "$phase"
+  log "webui job start id=$job pid=$$ input=$input"
+  "$MODDIR/bin/configctl" apply-import "$input" > "$output" 2>&1
+  job_rc=$?
+  result_tmp="$result.tmp.$$"
+  printf '%s\n' "$job_rc" > "$result_tmp" && mv -f "$result_tmp" "$result"
+  printf 'DONE %s\n' "$job_rc" > "$phase"
+  rm -f "$input" "$jobs/$job.pid"
+  log "webui job finish id=$job rc=$job_rc output=$output"
+  return 0
+}
+
+queue_apply() {
+  src=$1
+  job=$2
+  valid_job_id "$job" || { echo "E_JOB_ID" >&2; return 1; }
+  [ -f "$src" ] || { echo "E_JOB_SOURCE_MISSING" >&2; return 1; }
+  jobs="$STATE/jobs"
+  mkdir -p "$jobs" || return 1
+  input="$jobs/$job.json"; output="$jobs/$job.log"; result="$jobs/$job.rc"; phase="$jobs/$job.state"; pidfile="$jobs/$job.pid"
+  cp -af "$src" "$input" || return 1
+  rm -f "$result" "$output" "$pidfile"
+  printf '%s\n' QUEUED > "$phase"
+  "$MODDIR/bin/configctl" run-job "$job" >/dev/null 2>&1 </dev/null &
+  worker_pid=$!
+  printf '%s\n' "$worker_pid" > "$pidfile"
+  log "webui job queued id=$job worker_pid=$worker_pid source=$src"
+  echo "QUEUED $job"
+  return 0
+}
+
+job_status() {
+  job=$1
+  valid_job_id "$job" || { echo "E_JOB_ID" >&2; return 1; }
+  jobs="$STATE/jobs"; output="$jobs/$job.log"; result="$jobs/$job.rc"; phase="$jobs/$job.state"; pidfile="$jobs/$job.pid"
+  if [ -f "$result" ]; then
+    rc=$(cat "$result" 2>/dev/null)
+    echo "DONE ${rc:-1}"
+    [ -f "$output" ] && cat "$output"
+    return 0
+  fi
+  pid=$(cat "$pidfile" 2>/dev/null)
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    echo 'RUNNING'
+    return 0
+  fi
+  job_phase=$(cat "$phase" 2>/dev/null)
+  if [ "$job_phase" = QUEUED ] || [ "$job_phase" = RUNNING ]; then
+    echo 'DONE 125'
+    echo "E_JOB_WORKER_EXITED: id=$job phase=$job_phase pid=${pid:-unknown}; see $output"
+    [ -f "$output" ] && cat "$output"
+    return 0
+  fi
+  echo 'DONE 126'
+  echo "E_JOB_UNKNOWN: $job"
+}
+
+case "$cmd" in
+  validate) validate_config ;;
+  apply)
+    mode=normal
+    [ "$2" = --no-mount ] && mode=no-mount
+    [ "$2" = --boot ] && mode=boot
+    apply_config "$mode"
+    ;;
+  backup) backup_config ;;
+  restore-defaults) restore_defaults_preserve_unlock ;;
+  import) import_config "$2" ;;
+  apply-import) apply_import "$2" ;;
+  run-job) run_job "$2" ;;
+  queue-apply) queue_apply "$2" "$3" ;;
+  job-status) job_status "$2" ;;
+  mapping-data) mapping_data ;;
+  export)
+    outdir=/sdcard/Download/OPlusBrightness; mkdir -p "$outdir" || exit 1
+    stamp=$(date '+%Y%m%d-%H%M%S'); out="$outdir/config-$stamp.json"; cp -af "$CONFIG" "$out" && echo "$out"
+    ;;
+  verify-mounts) verify_mounts ;;
+  update-description) update_description ;;
+  *) usage; exit 2 ;;
+esac

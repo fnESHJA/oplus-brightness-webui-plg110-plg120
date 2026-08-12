@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#10131a">
+  <title>OPlus 亮度控制 - PLG110/120</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div>
+        <h1>OPlus 亮度控制 <span class="model-suffix">PLG110/120</span></h1>
+        <p id="deviceLine">正在读取设备原厂配置…</p>
+      </div>
+      <div id="statusPill" class="status loading">加载中</div>
+    </header>
+
+    <nav id="nav" class="nav" aria-label="页面">
+      <button data-page="home" class="active">主页</button>
+      <button data-page="hbm">HBM</button>
+      <button data-page="apps">应用</button>
+      <button data-page="games">游戏</button>
+      <button data-page="thermal">温度与电池</button>
+      <button data-page="advanced">其他联动</button>
+      <button data-page="mapping">亮度映射</button>
+      <button data-page="calibration">硬件标定</button>
+      <button data-page="settings">设置</button>
+    </nav>
+
+    <main id="content" tabindex="-1">
+      <section class="empty-state">
+        <div class="spinner"></div>
+        <p>正在解析 JSON 和原厂阈值</p>
+      </section>
+    </main>
+
+    <button id="saveButton" class="save-fab" disabled>
+      <span id="saveText">保存并应用</span>
+      <span id="dirtyCount" class="badge">0</span>
+    </button>
+  </div>
+
+  <dialog id="helpDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2 id="helpTitle">说明</h2>
+        <button class="icon-button" value="close" aria-label="关闭">×</button>
+      </div>
+      <div id="helpBody" class="help-body"></div>
+      <button class="primary" value="close">知道了</button>
+    </form>
+  </dialog>
+
+  <dialog id="resultDialog">
+    <form method="dialog">
+      <div class="dialog-head">
+        <h2 id="resultTitle">操作结果</h2>
+        <button class="icon-button" value="close" aria-label="关闭">×</button>
+      </div>
+      <pre id="resultBody"></pre>
+      <button class="primary" value="close">关闭</button>
+    </form>
+  </dialog>
+
+  <input id="importFile" type="file" accept="application/json,.json" hidden>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
